@@ -1,0 +1,8 @@
+steps:
+  - name: Build Android bundle
+    uses: AcmeSoftwareLLC/flutter-build@v2
+    with:
+      flutter-version: "3.19.6"         # 🐦 Optional: Flutter version
+      flutter-version-file: "example/pubspec.yaml" # 📄 Optional: pubspec.yaml for version
+      working-directory: example         # 📁 Optional: defaults to .
+      script: flutter build appbundle --release # 🛠️ Optional: custom build script
