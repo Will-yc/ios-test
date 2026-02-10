@@ -59,45 +59,77 @@ jobs:
           IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
           IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
           IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE }}
+          # 临时密码（避免空密码导致的钥匙串权限问题）
+          KEYCHAIN_PASSWORD: "github-actions-123"
         run: |
-          # 设置临时目录
-          CERT_PATH=$RUNNER_TEMP/ios_sign.p12
-          PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles
+          set -e  # 任何命令失败立即终止，便于定位
           
-          # 解码证书（关键修复）
-          echo "$IOS_P12_BASE64" | tr -d '\n\r' | base64 -D -o "$CERT_PATH"
+          # 1. 定义路径（避免转义符坑）
+          CERT_DIR="$RUNNER_TEMP/ios_certs"
+          CERT_PATH="$CERT_DIR/development.p12"
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          PROFILE_PATH="$PROFILE_DIR/ios_profile.mobileprovision"
           
-          # 验证文件大小
-          if [ -f "$CERT_PATH" ]; then
-            echo "✅ 证书文件已生成"
-            ls -lh "$CERT_PATH"
-          else
-            echo "❌ 证书文件生成失败"
+          # 2. 创建目录
+          mkdir -p "$CERT_DIR"
+          mkdir -p "$PROFILE_DIR"
+          
+          # 3. 解码证书（关键修复：macOS 用 base64 -d 而非 -D，且先写入临时文件再解码）
+          echo "🔍 开始解码证书，长度：${#IOS_P12_BASE64}"
+          # 先将 Base64 内容写入临时文件（避免管道符导致的截断）
+          echo "$IOS_P12_BASE64" > "$CERT_DIR/p12_base64_temp.txt"
+          # 解码（-d 是 macOS 标准参数，-D 是部分系统兼容参数，这里统一用 -d）
+          base64 -d "$CERT_DIR/p12_base64_temp.txt" > "$CERT_PATH"
+          
+          # 4. 验证证书文件（关键调试步骤）
+          echo "🔍 验证解码后的证书文件："
+          ls -lh "$CERT_PATH"
+          FILE_SIZE=$(stat -f%z "$CERT_PATH")
+          echo "证书文件大小：$FILE_SIZE 字节"
+          if [ $FILE_SIZE -lt 100 ]; then
+            echo "❌ 证书文件过小，解码失败！"
+            cat "$CERT_DIR/p12_base64_temp.txt"  # 输出 Base64 内容（脱敏后）
             exit 1
           fi
           
-          # 配置 keychain
-          security create-keychain -p "" ios-build.keychain
-          security list-keychains -d user -s ios-build.keychain
-          security default-keychain -d user -s ios-build.keychain
-          security unlock-keychain -p "" ios-build.keychain
-          security set-keychain-settings -lut 21600 ios-build.keychain
+          # 5. 本地验证证书密码（关键：在 GitHub Actions 中直接验证密码是否匹配）
+          echo "🔍 验证证书密码是否正确："
+          openssl pkcs12 -in "$CERT_PATH" -nokeys -passin pass:"$IOS_P12_PASSWORD"
+          if [ $? -eq 0 ]; then
+            echo "✅ 证书密码验证通过！"
+          else
+            echo "❌ 证书密码验证失败！"
+            exit 1
+          fi
           
-          # 导入证书
+          # 6. 配置钥匙串（修复权限坑）
+          echo "🔍 配置钥匙串："
+          security create-keychain -p "$KEYCHAIN_PASSWORD" ios-build.keychain
+          security list-keychains -d user -s ios-build.keychain "$HOME/Library/Keychains/login.keychain-db"
+          security default-keychain -d user -s ios-build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" ios-build.keychain
+          security set-keychain-settings -lut 7200 ios-build.keychain
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" ios-build.keychain
+          
+          # 7. 导入证书（-T 显式授权所有签名工具）
+          echo "🔍 导入证书到钥匙串："
           security import "$CERT_PATH" \
             -k ios-build.keychain \
             -P "$IOS_P12_PASSWORD" \
-            -A
+            -T /usr/bin/codesign \
+            -T /Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild \
+            -T /usr/bin/security \
+            -A  # 允许所有应用访问该证书
           
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: \
-            -s \
-            -k "" \
-            ios-build.keychain
+          # 8. 验证证书是否导入成功
+          echo "🔍 已导入的签名证书："
+          security find-identity -v -p codesigning ios-build.keychain
           
-          # 安装描述文件
-          mkdir -p "$PROFILE_PATH"
-          echo "$IOS_PROVISION_PROFILE_BASE64" | tr -d '\n\r' | base64 -D > "$PROFILE_PATH/ios_profile.mobileprovision"
+          # 9. 解码并安装描述文件
+          echo "🔍 解码描述文件："
+          echo "$IOS_PROVISION_PROFILE_BASE64" > "$CERT_DIR/profile_base64_temp.txt"
+          base64 -d "$CERT_DIR/profile_base64_temp.txt" > "$PROFILE_PATH"
+          ls -lh "$PROFILE_PATH"
 
       - name: Build iOS IPA
         run: |
