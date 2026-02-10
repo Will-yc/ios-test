@@ -1,7 +1,7 @@
 name: Flutter iOS Build
 
 on:
-  workflow_dispatch: # 允许手动触发
+  workflow_dispatch:
   push:
     branches: [main]
     paths:
@@ -16,7 +16,7 @@ jobs:
     env:
       BUILD_SCHEME: Runner
       BUILD_CONFIGURATION: Release
-      EXPORT_METHOD: app-store # app-store, ad-hoc, enterprise, development
+      EXPORT_METHOD: app-store
       FLUTTER_VERSION: '3.38.5'
 
     steps:
@@ -32,62 +32,145 @@ jobs:
           cache: true
           cache-key: flutter-${{ env.FLUTTER_VERSION }}-${{ hashFiles('pubspec.lock') }}
 
-      # 3. 获取依赖
-      - name: Install dependencies
+      # 3. 获取 Flutter 依赖
+      - name: Install Flutter dependencies
         run: |
           flutter pub get
-          cd ios && pod install --repo-update && cd ..
 
-      # 4. 安装 Apple 证书（使用官方认证的 Action）
+      # 4. 安装 iOS 依赖（使用 --verbose 查看详细信息）
+      - name: Install iOS dependencies
+        run: |
+          echo "📦 安装 iOS 依赖..."
+          cd ios
+          pod install --repo-update --verbose 2>&1 | tee pod_install.log
+          cd ..
+          echo "✅ iOS 依赖安装完成"
+
+      # 5. 关键修复：安装证书和描述文件（完整版本）
       - name: Install Apple certificate and provisioning profile
-        uses: apple-actions/import-codesign-certs@v2
-        with:
-          p12-file-base64: ${{ secrets.IOS_P12_BASE64 }}
-          p12-password: ${{ secrets.IOS_P12_PASSWORD }}
-          # 此 Action 会自动安装证书到临时钥匙链
-
-      # 5. 安装描述文件
-      - name: Install provisioning profile
         env:
-          PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE }}
+          P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
         run: |
           set -eo pipefail
           
-          # 创建临时文件
-          PP_PATH="$RUNNER_TEMP/build_pp.mobileprovision"
+          echo "🔐 开始安装证书和描述文件..."
           
-          # 解码描述文件（macOS 使用 base64 -d）
-          echo "$PROVISIONING_PROFILE_BASE64" | base64 -d > "$PP_PATH"
+          # 1. 解码证书
+          echo "📄 解码证书..."
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          echo "$P12_BASE64" | base64 -d > "$CERT_PATH"
           
-          # 验证解码结果
-          if [ ! -s "$PP_PATH" ]; then
+          # 验证证书文件
+          if [ ! -s "$CERT_PATH" ]; then
+            echo "❌ 证书解码失败或文件为空"
+            exit 1
+          fi
+          echo "✅ 证书解码成功，大小: $(wc -c < "$CERT_PATH") 字节"
+          
+          # 2. 验证证书密码
+          echo "🔑 验证证书密码..."
+          if openssl pkcs12 -in "$CERT_PATH" -nokeys -passin pass:"$P12_PASSWORD" &>/dev/null; then
+            echo "✅ 证书密码验证通过"
+          else
+            echo "❌ 证书密码验证失败"
+            exit 1
+          fi
+          
+          # 3. 配置钥匙串
+          echo "🔧 配置钥匙串..."
+          KEYCHAIN_NAME="ios-build.keychain"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          
+          # 创建新钥匙串
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security list-keychains -d user -s "$KEYCHAIN_NAME" "$HOME/Library/Keychains/login.keychain-db"
+          security default-keychain -d user -s "$KEYCHAIN_NAME"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN_NAME"
+          
+          # 4. 导入证书
+          echo "📥 导入证书到钥匙串..."
+          security import "$CERT_PATH" \
+            -k "$KEYCHAIN_NAME" \
+            -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/xcodebuild \
+            -T /usr/bin/security \
+            -A
+          
+          # 5. 验证证书导入
+          echo "🔍 验证已导入的证书..."
+          security find-identity -v -p codesigning "$KEYCHAIN_NAME"
+          
+          # 6. 解码描述文件
+          echo "📋 解码描述文件..."
+          PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          echo "$PROVISIONING_PROFILE_BASE64" | base64 -d > "$PROFILE_PATH"
+          
+          if [ ! -s "$PROFILE_PATH" ]; then
             echo "❌ 描述文件解码失败"
             exit 1
           fi
           
-          # 获取描述文件 UUID
-          UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$(security cms -D -i "$PP_PATH")")
-          echo "📱 描述文件 UUID: $UUID"
+          # 7. 获取描述文件信息（关键步骤！）
+          echo "📊 提取描述文件信息..."
+          PLIST_CONTENT=$(security cms -D -i "$PROFILE_PATH")
+          PROFILE_UUID=$(echo "$PLIST_CONTENT" | /usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin)
+          TEAM_ID=$(echo "$PLIST_CONTENT" | /usr/libexec/PlistBuddy -c 'Print TeamIdentifier:0' /dev/stdin)
+          APP_ID=$(echo "$PLIST_CONTENT" | /usr/libexec/PlistBuddy -c 'Print Entitlements:application-identifier' /dev/stdin 2>/dev/null || echo "未找到")
           
-          # 安装到标准位置（使用 UUID 作为文件名）
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/"$UUID.mobileprovision"
+          echo "📝 描述文件信息:"
+          echo "  UUID: $PROFILE_UUID"
+          echo "  Team ID: $TEAM_ID"
+          echo "  App ID: $APP_ID"
           
-          echo "✅ 描述文件安装成功: ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision"
+          # 8. 安装描述文件（使用UUID作为文件名）
+          echo "📂 安装描述文件..."
+          PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILES_DIR"
+          DEST_PATH="$PROFILES_DIR/$PROFILE_UUID.mobileprovision"
+          cp "$PROFILE_PATH" "$DEST_PATH"
           
-          # 验证安装
-          ls -lh ~/Library/MobileDevice/Provisioning\ Profiles/ | head -10
+          echo "✅ 描述文件安装到: $DEST_PATH"
+          ls -la "$PROFILES_DIR" | grep -i "$PROFILE_UUID"
+          
+          # 9. 将关键信息存储到环境变量
+          echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
+          echo "EXTRACTED_TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
+          echo "DETECTED_APP_ID=$APP_ID" >> $GITHUB_ENV
+          
+          # 10. 验证Team ID是否匹配
+          if [ "$TEAM_ID" != "${{ secrets.IOS_TEAM_ID }}" ]; then
+            echo "⚠️  警告：描述文件中的Team ID($TEAM_ID)与Secret中的(${{ secrets.IOS_TEAM_ID }})不匹配"
+          fi
 
-      # 6. 构建未签名的 Flutter 应用
-      - name: Build Flutter iOS (unsigned)
+      # 6. 调试：检查已安装的描述文件
+      - name: Debug: List installed profiles
         run: |
-          echo "🛠️  构建未签名的 iOS 应用..."
-          flutter build ios --release --no-codesign
-          echo "✅ 未签名构建完成"
+          echo "📋 已安装的描述文件:"
+          PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          ls -la "$PROFILES_DIR/" 2>/dev/null || echo "无描述文件目录"
+          
+          # 如果有文件，显示部分信息
+          for profile in "$PROFILES_DIR"/*.mobileprovision 2>/dev/null; do
+            if [ -f "$profile" ]; then
+              echo "=== $profile ==="
+              UUID=$(security cms -D -i "$profile" 2>/dev/null | /usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin 2>/dev/null || echo "无法读取")
+              echo "UUID: $UUID"
+              if [ "$UUID" = "${{ env.PROFILE_UUID }}" ]; then
+                echo "✅ 这是我们要使用的描述文件"
+              fi
+            fi
+          done
 
-      # 7. 创建 ExportOptions.plist 文件
-      - name: Create ExportOptions.plist
+      # 7. 直接使用Flutter构建IPA（最简单可靠的方式）
+      - name: Build IPA with Flutter command
         run: |
+          echo "🚀 使用Flutter命令直接构建IPA..."
+          
+          # 创建ExportOptions.plist
           cat > ios/ExportOptions.plist << EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -96,13 +179,13 @@ jobs:
               <key>method</key>
               <string>${{ env.EXPORT_METHOD }}</string>
               <key>teamID</key>
-              <string>${{ secrets.IOS_TEAM_ID }}</string>
+              <string>${{ env.EXTRACTED_TEAM_ID }}</string>
               <key>signingStyle</key>
               <string>manual</string>
               <key>provisioningProfiles</key>
               <dict>
                   <key>${{ secrets.IOS_BUNDLE_ID }}</key>
-                  <string>${{ secrets.IOS_PROVISIONING_PROFILE_UUID }}</string>
+                  <string>${{ env.PROFILE_UUID }}</string>
               </dict>
               <key>uploadBitcode</key>
               <false/>
@@ -110,94 +193,103 @@ jobs:
               <true/>
               <key>compileBitcode</key>
               <false/>
-              <key>destination</key>
-              <string>export</string>
           </dict>
           </plist>
           EOF
           
           echo "📄 ExportOptions.plist 内容:"
           cat ios/ExportOptions.plist
-
-      # 8. 生成 xcarchive
-      - name: Build xcarchive
-        env:
-          BUILD_PATH: build/ios
-        run: |
-          echo "📦 生成 xcarchive..."
           
-          # 清理旧构建
-          rm -rf "$BUILD_PATH" || true
+          # 清理并构建
+          flutter clean
           
-          # 构建 xcarchive
-          xcodebuild -workspace ios/Runner.xcworkspace \
-                     -scheme "$BUILD_SCHEME" \
-                     -configuration "$BUILD_CONFIGURATION" \
-                     -destination 'generic/platform=iOS' \
-                     -archivePath "$BUILD_PATH/archive/Runner.xcarchive" \
-                     DEVELOPMENT_TEAM="${{ secrets.IOS_TEAM_ID }}" \
-                     PROVISIONING_PROFILE_SPECIFIER="${{ secrets.IOS_PROVISIONING_PROFILE_UUID }}" \
-                     CODE_SIGN_STYLE="Manual" \
-                     clean archive
+          echo "🛠️  开始构建IPA..."
+          flutter build ipa \
+            --release \
+            --export-options-plist=ios/ExportOptions.plist \
+            --verbose 2>&1 | tee flutter_build.log || {
+              echo "❌ Flutter构建失败，查看日志末尾:"
+              tail -100 flutter_build.log
+              exit 1
+            }
           
-          echo "✅ xcarchive 生成完成"
-          ls -lh "$BUILD_PATH/archive/"
-
-      # 9. 导出 IPA 文件
-      - name: Export IPA
-        run: |
-          echo "🚀 导出 IPA 文件..."
+          echo "✅ IPA构建完成!"
           
-          # 导出 IPA
-          xcodebuild -exportArchive \
-                     -archivePath build/ios/archive/Runner.xcarchive \
-                     -exportPath build/ios/ipa \
-                     -exportOptionsPlist ios/ExportOptions.plist \
-                     -allowProvisioningUpdates
-          
-          echo "✅ IPA 导出完成"
-          
-          # 列出生成的 IPA 文件
-          echo "📱 生成的 IPA 文件:"
-          ls -lh build/ios/ipa/*.ipa
-
-      # 10. 验证代码签名
-      - name: Verify code signing
-        run: |
-          echo "🔐 验证代码签名..."
-          IPA_PATH=$(find build/ios/ipa -name "*.ipa" | head -1)
-          
-          if [ -z "$IPA_PATH" ]; then
-            echo "❌ 未找到 IPA 文件"
-            exit 1
+          # 检查生成的IPA
+          if ls build/ios/ipa/*.ipa 1>/dev/null 2>&1; then
+            echo "📱 找到IPA文件:"
+            ls -lh build/ios/ipa/*.ipa
+          else
+            echo "⚠️  未在默认位置找到IPA，搜索所有位置:"
+            find build -name "*.ipa" -type f 2>/dev/null
           fi
-          
-          # 解压 IPA 查看签名
-          TEMP_DIR="$RUNNER_TEMP/ipa_check"
-          mkdir -p "$TEMP_DIR"
-          unzip -q "$IPA_PATH" -d "$TEMP_DIR"
-          
-          # 检查签名
-          codesign -dv --verbose=4 "$TEMP_DIR/Payload/Runner.app" 2>&1 | grep -A5 -B5 "Authority" || true
-          
-          echo "✅ 签名验证完成"
 
-      # 11. 上传构建产物
+      # 8. 备用方案：使用xcodebuild（如果Flutter构建失败）
+      - name: Alternative xcodebuild archive (fallback)
+        if: failure() && steps.build-ipa.outcome == 'failure'
+        run: |
+          echo "🔄 尝试备用方案：直接使用xcodebuild构建archive..."
+          
+          # 先构建未签名的Flutter应用
+          flutter build ios --release --no-codesign
+          
+          # 使用从描述文件中提取的UUID
+          echo "🔧 使用描述文件UUID: ${{ env.PROFILE_UUID }}"
+          echo "🔧 使用Team ID: ${{ env.EXTRACTED_TEAM_ID }}"
+          
+          # 构建archive
+          xcodebuild -workspace ios/Runner.xcworkspace \
+                     -scheme Runner \
+                     -configuration Release \
+                     -destination 'generic/platform=iOS' \
+                     -archivePath build/Runner.xcarchive \
+                     DEVELOPMENT_TEAM="${{ env.EXTRACTED_TEAM_ID }}" \
+                     PROVISIONING_PROFILE="${{ env.PROFILE_UUID }}" \
+                     CODE_SIGN_STYLE="Manual" \
+                     CODE_SIGN_IDENTITY="Apple Distribution" \
+                     clean archive 2>&1 | tee xcode_archive.log || {
+                       echo "❌ xcodebuild archive失败"
+                       tail -50 xcode_archive.log
+                       exit 1
+                     }
+          
+          echo "✅ Archive创建成功"
+          
+          # 导出IPA
+          xcodebuild -exportArchive \
+                     -archivePath build/Runner.xcarchive \
+                     -exportPath build/ipa \
+                     -exportOptionsPlist ios/ExportOptions.plist \
+                     -allowProvisioningUpdates 2>&1 | tee xcode_export.log || {
+                       echo "❌ 导出IPA失败"
+                       tail -50 xcode_export.log
+                       exit 1
+                     }
+          
+          echo "✅ IPA导出完成"
+          ls -lh build/ipa/*.ipa 2>/dev/null || echo "⚠️  在build/ipa目录未找到IPA"
+
+      # 9. 上传构建产物
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: iOS-IPA-${{ github.run_number }}
-          path: build/ios/ipa/*.ipa
+          path: |
+            build/ios/ipa/*.ipa
+            build/ipa/*.ipa
+            build/*.ipa
           retention-days: 90
           if-no-files-found: error
 
-      # 12. 上传构建日志
+      # 10. 上传构建日志
       - name: Upload build logs
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: Build-Logs-${{ github.run_number }}
           path: |
-            ${{ github.workspace }}/flutter_build.log
-            ${{ github.workspace }}/ios_build.log
+            flutter_build.log
+            pod_install.log
+            xcode_archive.log
+            xcode_export.log
           retention-days: 30
