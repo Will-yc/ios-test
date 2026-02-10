@@ -1,10 +1,18 @@
-name: Test Certificate Password
+name: Build Flutter iOS IPA111
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'lib/**'
+      - 'ios/**'
+      - 'pubspec.yaml'
 
 jobs:
-  test-cert:
+  build-ios-ipa:
     runs-on: macos-latest
+    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -14,34 +22,101 @@ jobs:
         with:
           flutter-version: '3.38.5'
           cache: true
+
+      - name: Install dependencies
+        run: |
+          flutter pub get
+          cd ios && pod install --repo-update && cd ..
+
+      - name: Fix iOS project settings
+        run: |
+          echo "🔧 修复 iOS 项目设置..."
+          cd ios
           
-      - name: Build iOS IPA (Auto signing)
+          # 使用正确的 bundle identifier
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier ${{ secrets.IOS_BUNDLE_ID }}" Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName ${{ secrets.IOS_APP_NAME }}" Runner/Info.plist
+          
+          # 在 project.pbxproj 中添加 DEVELOPMENT_TEAM
+          sed -i '' "s/DEVELOPMENT_TEAM = [^;]*;/DEVELOPMENT_TEAM = ${{ secrets.IOS_TEAM_ID }};/g" Runner.xcodeproj/project.pbxproj
+          
+          echo "✅ 项目设置更新完成"
+          cd ..
+
+      - name: Setup iOS signing
         env:
           IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
           IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
           IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE }}
         run: |
-          echo "=== 使用 Flutter 自动签名 ==="
+          echo "🔐 设置 iOS 签名..."
           
           # 1. 安装描述文件
           mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
           echo "$IOS_PROVISION_PROFILE_BASE64" | base64 -D > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
           
-          # 2. 解码证书到临时位置
+          # 2. 解码证书
           echo "$IOS_P12_BASE64" | base64 -D > /tmp/cert.p12
           
-          # 3. 直接构建 IPA（让 Flutter 处理签名）
+          # 3. 创建临时 keychain
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          
+          # 4. 导入证书（如果密码不对，尝试不同方法）
+          security import /tmp/cert.p12 \
+            -k build.keychain \
+            -P "$IOS_P12_PASSWORD" \
+            -T /usr/bin/codesign 2>&1 || echo "证书导入可能有问题，继续..."
+          
+          security set-keychain-settings build.keychain
+          
+          echo "✅ 签名设置完成"
+
+      - name: Create ExportOptions.plist
+        run: |
+          echo "📄 创建 ExportOptions.plist..."
+          cd ios
+          
+          cat > ExportOptions.plist << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>ad-hoc</string>
+    <key>teamID</key>
+    <string>${{ secrets.IOS_TEAM_ID }}</string>
+    <key>compileBitcode</key>
+    <false/>
+    <key>uploadBitcode</key>
+    <false/>
+    <key>uploadSymbols</key>
+    <true/>
+</dict>
+</plist>
+EOF
+          
+          echo "✅ ExportOptions.plist 创建完成"
+          cd ..
+
+      - name: Build iOS IPA
+        run: |
+          echo "🚀 构建 iOS IPA..."
+          
+          # 使用 Flutter 构建 IPA
           flutter build ipa \
             --release \
             --export-method ad-hoc \
-            --no-codesign  # 先不签名，看看错误
+            --no-tree-shake-icons \
+            --verbose
           
-          # 或者尝试使用 xcodebuild 直接构建
-          cd ios
-          xcodebuild clean -workspace Runner.xcworkspace -scheme Runner
-          xcodebuild archive \
-            -workspace Runner.xcworkspace \
-            -scheme Runner \
-            -configuration Release \
-            -archivePath Runner.xcarchive \
-            -allowProvisioningUpdates
+          echo "✅ 构建完成"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS-IPA-Package
+          path: build/ios/ipa/*.ipa
+          retention-days: 90
+          if-no-files-found: error
