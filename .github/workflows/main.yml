@@ -27,19 +27,32 @@ jobs:
         run: |
           flutter pub get
           cd ios && pod install --repo-update && cd ..
+
+      # ✅ 修复：添加 env 块
       - name: Debug certificate
+        env:
+          IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
         run: |
-          # 检查 Secret 是否为空
+          echo "=== Secret 可用性检查 ==="
+          
+          # 检查长度（使用 shell 变量）
           echo "P12 Base64 length: ${#IOS_P12_BASE64}"
           echo "Password length: ${#IOS_P12_PASSWORD}"
           
-          # 尝试不同的解码方式
-          echo "$IOS_P12_BASE64" | base64 -D > test1.p12 2>&1 || echo "方式1失败"
-          echo "$IOS_P12_BASE64" | tr -d '\n' | base64 -D > test2.p12 2>&1 || echo "方式2失败"
+          # 检查是否为空
+          [ -z "$IOS_P12_BASE64" ] && echo "❌ P12 为空" || echo "✅ P12 已设置"
+          [ -z "$IOS_P12_PASSWORD" ] && echo "❌ Password 为空" || echo "✅ Password 已设置"
           
-          # 检查文件类型
-          file test*.p12
-
+          # 尝试解码（仅在非空时）
+          if [ ! -z "$IOS_P12_BASE64" ]; then
+            echo "$IOS_P12_BASE64" | base64 -D > test1.p12 2>&1 && echo "✅ 方式1成功" || echo "❌ 方式1失败"
+            echo "$IOS_P12_BASE64" | tr -d '\n' | base64 -D > test2.p12 2>&1 && echo "✅ 方式2成功" || echo "❌ 方式2失败"
+            
+            # 检查文件
+            ls -lh test*.p12 2>/dev/null || echo "❌ 未生成文件"
+            file test*.p12 2>/dev/null || echo "❌ 文件类型检测失败"
+          fi
 
       - name: Import iOS signing certificates
         env:
@@ -55,7 +68,13 @@ jobs:
           echo "$IOS_P12_BASE64" | tr -d '\n\r' | base64 -D -o "$CERT_PATH"
           
           # 验证文件大小
-          ls -lh "$CERT_PATH"
+          if [ -f "$CERT_PATH" ]; then
+            echo "✅ 证书文件已生成"
+            ls -lh "$CERT_PATH"
+          else
+            echo "❌ 证书文件生成失败"
+            exit 1
+          fi
           
           # 配置 keychain
           security create-keychain -p "" ios-build.keychain
