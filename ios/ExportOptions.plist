@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- 导出类型：ad-hoc / app-store / enterprise / development -->
+  <key>method</key>
+  <string>ad-hoc</string>
+  <!-- 是否自动签名（建议关闭，使用手动导入的证书） -->
+  <key>signingStyle</key>
+  <string>manual</string>
+  <!-- 你的 Team ID（Apple Developer 后台查看） -->
+  <key>teamID</key>
+  <string>XHFPJA66Z2</string>
+  <!-- 是否包含符号表（可选） -->
+  <key>uploadSymbols</key>
+  <true/>
+  <!-- 仅 App Store 导出需要 -->
+  <!-- <key>uploadBitcode</key>
+  <false/> -->
+</dict>
+</plist>
