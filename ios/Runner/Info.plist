@@ -45,5 +45,24 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- 全局允许所有 HTTP 访问（最简单，但苹果审核时需说明理由） -->
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
+
+	<!-- 麦克风权限（对应 RECORD_AUDIO） -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>需要访问麦克风来录制音频</string>
+
+	<!-- 相册读写权限（对应 READ/WRITE_EXTERNAL_STORAGE） -->
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>需要访问相册来读取/保存文件</string>
+
+	<!-- 仅写入相册权限（可选，iOS 11+ 推荐补充） -->
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>需要访问相册来保存文件</string>
 </dict>
 </plist>

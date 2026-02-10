@@ -1,8 +1,92 @@
-steps:
-  - name: Build Android bundle
-    uses: AcmeSoftwareLLC/flutter-build@v2
-    with:
-      flutter-version: "3.19.6"         # 🐦 Optional: Flutter version
-      flutter-version-file: "example/pubspec.yaml" # 📄 Optional: pubspec.yaml for version
-      working-directory: example         # 📁 Optional: defaults to .
-      script: flutter build appbundle --release # 🛠️ Optional: custom build script
+# 工作流名称
+name: Build Flutter iOS IPA
+
+# 触发条件：手动触发 + 推送到main分支触发
+on:
+  workflow_dispatch:  # 手动触发（推荐，避免每次推送都打包）
+  push:
+    branches: [ main ]
+    paths:
+      - 'lib/**'
+      - 'ios/**'
+      - 'pubspec.yaml'  # 仅当核心代码/配置变更时触发
+
+# 定义任务
+jobs:
+  build-ios-ipa:
+    # 指定运行环境（macOS 是打包 iOS 必需的，ubuntu/windows 无法打包 iOS）
+    runs-on: macos-latest
+    
+    steps:
+      # 步骤1：拉取代码仓库
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 步骤2：设置 Flutter 环境
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          # 指定 Flutter 版本（建议和本地开发版本一致）
+          flutter-version: '3.38.5'
+          # 可选：启用 Flutter 缓存，加速后续构建
+          cache: true
+
+      # 步骤3：安装 Flutter 依赖
+      - name: Install Flutter dependencies
+        run: |
+          flutter pub get
+          # 可选：更新 iOS 原生依赖（如果用到 CocoaPods）
+          cd ios
+          pod install --repo-update
+          cd ..
+
+      # 步骤4：导入 iOS 签名证书和描述文件（关键步骤）
+      - name: Import iOS signing certificates
+        env:
+          # 从 GitHub Secrets 读取证书/密码/描述文件
+          IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE }}
+        run: |
+          # 创建证书目录
+          mkdir -p ~/Library/MobileDevice/Certificates
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          
+          # 解码并保存 p12 证书
+          echo "$IOS_P12_BASE64" | base64 --decode > ~/Library/MobileDevice/Certificates/ios_sign.p12
+          
+          # 导入证书到钥匙串（忽略安全提示）
+          security create-keychain -p github-actions ios-build.keychain
+          security default-keychain -s ios-build.keychain
+          security unlock-keychain -p github-actions ios-build.keychain
+          security import ~/Library/MobileDevice/Certificates/ios_sign.p12 -k ios-build.keychain -P "$IOS_P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k github-actions ios-build.keychain
+          
+          # 解码并保存描述文件
+          echo "$IOS_PROVISION_PROFILE_BASE64" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/ios_profile.mobileprovision
+
+      # 步骤5：构建 Flutter iOS 项目（生成 IPA）
+      - name: Build iOS IPA
+        env:
+          # 从 GitHub Secrets 读取 Bundle ID 和签名信息
+          IOS_BUNDLE_ID: ${{ secrets.IOS_BUNDLE_ID }}
+          IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+        run: |
+          # 清理之前的构建产物
+          flutter clean
+          
+          # 构建 Release 版本的 IPA（关键命令）
+          flutter build ipa \
+            --release \
+            --bundle-identifier "$IOS_BUNDLE_ID" \
+            --export-options-plist=ios/ExportOptions.plist  # 导出配置文件（需提前准备）
+
+      # 步骤6：上传 IPA 包作为构建产物（可下载）
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iOS-IPA-Package
+          # IPA 包默认生成路径
+          path: build/ios/ipa/*.ipa
+          # 保留产物90天（默认90天，可自定义）
+          retention-days: 90
