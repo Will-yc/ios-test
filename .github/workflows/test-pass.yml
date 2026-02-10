@@ -6,6 +6,15 @@ jobs:
   test-cert:
     runs-on: macos-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.5'
+          cache: true
+          
       - name: Build iOS IPA (Auto signing)
         env:
           IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
