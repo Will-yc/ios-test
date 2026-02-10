@@ -47,7 +47,7 @@ jobs:
           # 尝试解码（仅在非空时）
           if [ ! -z "$IOS_P12_BASE64" ]; then
             echo "$IOS_P12_BASE64" | base64 -D > test1.p12 2>&1 && echo "✅ 方式1成功" || echo "❌ 方式1失败"
-            echo "$IOS_P12_BASE64" | tr -d '\n' | base64 -D > test2.p12 2>&1 && echo "✅ 方式2成功" || echo "❌ 方式2失败"
+            echo "$IOS_P12_BASE64" | tr -d '\n\r' | base64 -D > test2.p12 2>&1 && echo "✅ 方式2成功" || echo "❌ 方式2失败"
             
             # 检查文件
             ls -lh test*.p12 2>/dev/null || echo "❌ 未生成文件"
