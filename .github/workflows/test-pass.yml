@@ -1,59 +1,38 @@
-- name: Build iOS IPA (Auto signing)
-  env:
-    IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
-    IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
-    IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE }}
-  run: |
-    echo "=== 使用 Flutter 自动签名 ==="
-    
-    # 1. 安装描述文件
-    mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-    echo "$IOS_PROVISION_PROFILE_BASE64" | base64 -D > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
-    
-    # 2. 解码证书到临时位置
-    echo "$IOS_P12_BASE64" | base64 -D > /tmp/cert.p12
-    
-    # 3. 直接构建 IPA（让 Flutter 处理签名）
-    flutter build ipa \
-      --release \
-      --export-method ad-hoc \
-      --no-codesign  # 先不签名，看看错误
-    
-    # 或者尝试使用 xcodebuild 直接构建
-    cd ios
-    xcodebuild clean -workspace Runner.xcworkspace -scheme Runner
-    xcodebuild archive \
-      -workspace Runner.xcworkspace \
-      -scheme Runner \
-      -configuration Release \
-      -archivePath Runner.xcarchive \
-      -allowProvisioningUpdates- name: Build iOS IPA (Auto signing)
-  env:
-    IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
-    IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
-    IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE }}
-  run: |
-    echo "=== 使用 Flutter 自动签名 ==="
-    
-    # 1. 安装描述文件
-    mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-    echo "$IOS_PROVISION_PROFILE_BASE64" | base64 -D > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
-    
-    # 2. 解码证书到临时位置
-    echo "$IOS_P12_BASE64" | base64 -D > /tmp/cert.p12
-    
-    # 3. 直接构建 IPA（让 Flutter 处理签名）
-    flutter build ipa \
-      --release \
-      --export-method ad-hoc \
-      --no-codesign  # 先不签名，看看错误
-    
-    # 或者尝试使用 xcodebuild 直接构建
-    cd ios
-    xcodebuild clean -workspace Runner.xcworkspace -scheme Runner
-    xcodebuild archive \
-      -workspace Runner.xcworkspace \
-      -scheme Runner \
-      -configuration Release \
-      -archivePath Runner.xcarchive \
-      -allowProvisioningUpdates
+name: Test Certificate Password
+
+on: workflow_dispatch
+
+jobs:
+  test-cert:
+    runs-on: macos-latest
+    steps:
+      - name: Build iOS IPA (Auto signing)
+        env:
+          IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE }}
+        run: |
+          echo "=== 使用 Flutter 自动签名 ==="
+          
+          # 1. 安装描述文件
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$IOS_PROVISION_PROFILE_BASE64" | base64 -D > ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision
+          
+          # 2. 解码证书到临时位置
+          echo "$IOS_P12_BASE64" | base64 -D > /tmp/cert.p12
+          
+          # 3. 直接构建 IPA（让 Flutter 处理签名）
+          flutter build ipa \
+            --release \
+            --export-method ad-hoc \
+            --no-codesign  # 先不签名，看看错误
+          
+          # 或者尝试使用 xcodebuild 直接构建
+          cd ios
+          xcodebuild clean -workspace Runner.xcworkspace -scheme Runner
+          xcodebuild archive \
+            -workspace Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -archivePath Runner.xcarchive \
+            -allowProvisioningUpdates
