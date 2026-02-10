@@ -27,6 +27,19 @@ jobs:
         run: |
           flutter pub get
           cd ios && pod install --repo-update && cd ..
+      - name: Debug certificate
+        run: |
+          # 检查 Secret 是否为空
+          echo "P12 Base64 length: ${#IOS_P12_BASE64}"
+          echo "Password length: ${#IOS_P12_PASSWORD}"
+          
+          # 尝试不同的解码方式
+          echo "$IOS_P12_BASE64" | base64 -D > test1.p12 2>&1 || echo "方式1失败"
+          echo "$IOS_P12_BASE64" | tr -d '\n' | base64 -D > test2.p12 2>&1 || echo "方式2失败"
+          
+          # 检查文件类型
+          file test*.p12
+
 
       - name: Import iOS signing certificates
         env:
