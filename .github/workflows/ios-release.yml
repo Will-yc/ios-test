@@ -226,7 +226,7 @@ jobs:
               <key>compileBitcode</key>
               <false/>
               <key>method</key>
-              <string>app-store</string>
+              <string>ad-hoc</string>
               <key>provisioningProfiles</key>
               <dict>
                   <key>com.zhiyuexctest.app</key>
