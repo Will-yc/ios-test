@@ -1,6 +1,7 @@
 import 'dart:collection';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import 'package:my_flutter_app/demo/util/my_dual_util.dart';
 
@@ -170,6 +171,7 @@ class PcmPlayer {
   }
 
   /// FlutterPcmSound 请求数据的回调
+  /// FlutterPcmSound 请求数据的回调
   void _onFeed(int remainingFrames) async {
     _remainingFrames = remainingFrames;
     onStateChanged?.call();
@@ -179,17 +181,20 @@ class PcmPlayer {
     try {
       _isFeeding = true;
 
-      // 计算需要的样本数
+      // 计算需要的样本数 - 使用更保守的策略
       final int samplesNeeded;
 
       if (remainingFrames <= 0) {
-        // 如果remainingFrames为0或负数，使用默认帧大小
-        samplesNeeded = 320; // 20ms @ 16kHz
+        // 如果remainingFrames为0或负数，提供更多数据
+        samplesNeeded = 640; // 40ms @ 16kHz
         debugPrint(
-          '[PcmPlayer] remainingFrames为$remainingFrames，使用默认帧大小: $samplesNeeded',
+          '[PcmPlayer] remainingFrames为$remainingFrames，喂更多数据: $samplesNeeded',
         );
+      } else if (remainingFrames < 160) {
+        // 如果剩余帧很少，也喂更多数据
+        samplesNeeded = 480; // 30ms @ 16kHz
       } else {
-        samplesNeeded = remainingFrames;
+        samplesNeeded = remainingFrames.clamp(160, 960); // 限制在10-60ms之间
       }
 
       final List<int> samplesToFeed;
@@ -202,7 +207,7 @@ class PcmPlayer {
         );
         debugPrint('[PcmPlayer] 喂 $samplesNeeded 样本, 缓冲区剩余: ${_buffer.length}');
       } else if (_buffer.isNotEmpty) {
-        // 部分数据 + 静音填充
+        // 部分数据 + 静音填充（但保持总数为samplesNeeded）
         final available = _buffer.length;
         final data = List<int>.generate(
           available,
@@ -211,19 +216,35 @@ class PcmPlayer {
         final silence = List<int>.filled(samplesNeeded - available, 0);
         samplesToFeed = [...data, ...silence];
         debugPrint(
-          '[PcmPlayer] 部分喂 $available 样本 + ${samplesNeeded - available} 静音, 缓冲区剩余: ${_buffer.length}',
+          '[PcmPlayer] 部分喂 $available 样本 + ${samplesNeeded - available} 静音',
         );
       } else {
-        // 无数据，喂静音
+        // 无数据，喂静音（但维持播放）
         samplesToFeed = List<int>.filled(samplesNeeded, 0);
-        debugPrint('[PcmPlayer] 无数据，喂 $samplesNeeded 静音样本');
+        debugPrint('[PcmPlayer] 缓冲区空，喂 $samplesNeeded 静音样本');
       }
 
-      await FlutterPcmSound.feed(PcmArrayInt16.fromList(samplesToFeed));
+      // 确保喂数据不会抛出异常
+      try {
+        await FlutterPcmSound.feed(PcmArrayInt16.fromList(samplesToFeed));
+      } catch (e) {
+        debugPrint('[PcmPlayer] FlutterPcmSound.feed 失败: $e');
+        // 如果喂数据失败，稍后重试
+        await Future.delayed(Duration(milliseconds: 10));
+      }
     } catch (e) {
-      debugPrint('[PcmPlayer] 喂数据失败: $e');
+      debugPrint('[PcmPlayer] 喂数据过程中异常: $e');
     } finally {
       _isFeeding = false;
+
+      // 如果缓冲区仍然有数据，尽快处理下一次喂数据
+      if (_buffer.isNotEmpty && _isPlaying) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (_isPlaying && !_isFeeding && _buffer.length >= 320) {
+            _tryFeedImmediately();
+          }
+        });
+      }
     }
   }
 }

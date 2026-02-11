@@ -65,10 +65,13 @@ class _PcmSoundAppOpusState extends State<PcmSoundAppOpus>
     // 初始化播放引擎
     _player.init();
 
-    // 设置 Opus 编码器参数
+    // 设置 Opus 编码器参数 - 修改为更适合语音的配置
     if (encoder != null) {
-      encoder!.setBitrate(64000);
-      encoder!.setComplexity(5);
+      // 设置比特率（16kHz采样率建议使用8k-32k比特率）
+      encoder!.setBitrate(16000); // 16kbps更适合16kHz语音
+
+      // 设置复杂度（中等复杂度）
+      encoder!.setComplexity(3);
     }
   }
 
@@ -131,7 +134,7 @@ class _PcmSoundAppOpusState extends State<PcmSoundAppOpus>
         final frameSamples = int16Samples.sublist(start, end);
         final Int16List pcmDataForEncode = Int16List.fromList(frameSamples);
 
-        // 4. Opus 编码
+        // 4. Opus 编码 - 确保帧大小正确
         final Uint8List? encodedData = encoder!.encode(
           pcmDataForEncode,
           frameSize,
@@ -141,20 +144,50 @@ class _PcmSoundAppOpusState extends State<PcmSoundAppOpus>
           continue;
         }
 
-        // 5. Opus 解码
-        final Uint8List? decodedPcm = decoder!.decode(encodedData, frameSize);
-        if (decodedPcm == null) {
-          debugPrint('Opus 解码失败');
+        // 5. 验证编码后的数据是否有效
+        if (encodedData.isEmpty) {
+          debugPrint('编码后数据为空，跳过');
           continue;
         }
 
-        // 6. 直接写入播放器缓冲区（已经是 16kHz）
-        _player.write8Samples(decodedPcm);
+        // 6. Opus 解码
+        try {
+          final Uint8List? decodedPcm = decoder!.decode(encodedData, frameSize);
+          if (decodedPcm == null) {
+            debugPrint('Opus 解码失败: 返回null');
 
-        // 添加小延迟避免缓冲区溢出
-        if (i % 10 == 0) {
-          // 每处理10帧休息一下
-          Future.delayed(Duration(microseconds: 100));
+            // 用静音填充
+            final silence = Uint8List(
+              frameSize * 2,
+            ); // 16kHz, 16-bit: 320 * 2 bytes
+            _player.write8Samples(silence);
+            continue;
+          }
+
+          if (decodedPcm.isEmpty) {
+            debugPrint('解码后数据为空');
+            continue;
+          }
+
+          // 7. 验证解码后的数据长度是否正确
+          if (decodedPcm.length != frameSize * 2) {
+            // 16-bit 样本，所以是 frameSize * 2
+            debugPrint('解码数据长度异常: ${decodedPcm.length}, 期望: ${frameSize * 2}');
+
+            // 创建静音帧
+            final silence = Uint8List(frameSize * 2);
+            _player.write8Samples(silence);
+            continue;
+          }
+
+          // 8. 写入播放器缓冲区
+          _player.write8Samples(decodedPcm);
+        } catch (e) {
+          debugPrint('Opus 解码异常: $e');
+
+          // 写入静音
+          final silence = Uint8List(frameSize * 2);
+          _player.write8Samples(silence);
         }
       }
     } catch (e) {
