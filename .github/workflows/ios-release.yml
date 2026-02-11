@@ -134,7 +134,7 @@ jobs:
           
           # 提取团队ID（需要根据你的实际情况修改）
           TEAM_ID="XHFPJA66Z2"  # 替换为你的团队ID
-          PROFILE_NAME="zyxctest.mobileprovision"  # 替换为你的描述文件名称
+          PROFILE_NAME="ios_profile.mobileprovision"  # 替换为你的描述文件名称
           
           # 创建 ExportOptions.plist
           cat > ios/ExportOptions.plist << EOF
