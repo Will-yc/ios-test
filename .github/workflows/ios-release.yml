@@ -13,7 +13,6 @@ jobs:
   build-ios-ipa:
     runs-on: macos-latest
     
-    # ✅ 在 job 级别定义环境变量，所有 step 共享
     env:
       KEYCHAIN_NAME: "ios-build.keychain-db"
       KEYCHAIN_PASSWORD: "ci-keychain-password-12345"
@@ -33,7 +32,6 @@ jobs:
           flutter pub get
           cd ios && pod install --repo-update && cd ..
 
-      # ✅ 修复：直接导入P12，不转PEM
       - name: Import iOS signing certificates
         env:
           IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
@@ -41,159 +39,185 @@ jobs:
           IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE }}
         run: |
           set -euo pipefail
-          echo "=== 开始导入证书 ==="
-
-          # 1. 解码P12证书文件
+          
+          # 解码P12
           echo "$IOS_P12_BASE64" | base64 --decode > /tmp/distribution.p12
-          echo "✅ P12文件大小: $(wc -c < /tmp/distribution.p12) bytes"
-
-          # 2. 验证P12文件有效性
-          echo "验证P12文件..."
+          
+          # 验证P12
           openssl pkcs12 -in /tmp/distribution.p12 \
-            -passin pass:"$IOS_P12_PASSWORD" \
-            -noout 2>&1 && echo "✅ P12文件有效" || {
-            echo "❌ P12文件无效或密码错误"
-            exit 1
-          }
-
-          # 3. 显示P12中的证书信息（调试用）
-          echo "P12证书信息:"
-          openssl pkcs12 -in /tmp/distribution.p12 \
-            -passin pass:"$IOS_P12_PASSWORD" \
-            -nokeys -clcerts | openssl x509 -noout -subject -issuer -dates 2>/dev/null || true
-
-          # 4. 创建临时钥匙串（使用固定密码，确保一致性）
-          echo "创建临时钥匙串..."
+            -passin pass:"$IOS_P12_PASSWORD" -noout
+          echo "✅ P12文件有效"
+          
+          # 创建钥匙串
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
-          
-          # 5. 将临时钥匙串添加到搜索列表（保留login钥匙串）
           security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | tr -d '"')
-          
-          # 6. 设为默认钥匙串
           security default-keychain -d user -s "$KEYCHAIN_NAME"
-          
-          # 7. 解锁钥匙串
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
-          
-          # 8. 设置超时时间（6小时）
           security set-keychain-settings -t 21600 -u "$KEYCHAIN_NAME"
-
-          # 9. ✅ 关键修复：直接导入P12文件（不转PEM）
-          echo "导入P12证书到钥匙串..."
+          
+          # 导入P12
           security import /tmp/distribution.p12 \
             -k "$KEYCHAIN_NAME" \
             -P "$IOS_P12_PASSWORD" \
             -T /usr/bin/codesign \
             -T /usr/bin/security \
-            -T /usr/bin/productsign \
             -f pkcs12
-
-          # 10. ✅ 关键修复：设置钥匙串分区列表
-          echo "设置钥匙串访问权限..."
+          
+          # 设置权限
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
-            -s \
-            -k "$KEYCHAIN_PASSWORD" \
-            "$KEYCHAIN_NAME"
-
-          # 11. 验证证书已导入
-          echo ""
-          echo "========================================="
-          echo "✅ 已导入的代码签名证书:"
-          echo "========================================="
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+          
+          # 验证
           security find-identity -v -p codesigning "$KEYCHAIN_NAME"
           
-          CERT_COUNT=$(security find-identity -v -p codesigning "$KEYCHAIN_NAME" | grep -c "valid identities found" || true)
-          echo "证书数量检查: $CERT_COUNT"
-          
-          # 确保至少有一个有效证书
-          if security find-identity -v -p codesigning "$KEYCHAIN_NAME" | grep -q "0 valid identities found"; then
-            echo "❌ 没有找到有效的签名证书！"
-            echo ""
-            echo "调试信息 - 钥匙串中所有证书:"
-            security find-identity "$KEYCHAIN_NAME"
-            echo ""
-            echo "调试信息 - 所有钥匙串中的签名证书:"
-            security find-identity -v -p codesigning
-            exit 1
-          fi
-
-          # 12. 安装描述文件
-          echo ""
-          echo "安装描述文件..."
+          # 安装描述文件
           PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
           mkdir -p "$PROFILE_DIR"
+          echo "$IOS_PROVISION_PROFILE_BASE64" | base64 --decode \
+            > "$PROFILE_DIR/ios_profile.mobileprovision"
           
-          echo "$IOS_PROVISION_PROFILE_BASE64" | base64 --decode > "$PROFILE_DIR/ios_profile.mobileprovision"
-          echo "✅ 描述文件大小: $(wc -c < "$PROFILE_DIR/ios_profile.mobileprovision") bytes"
-
-          # 13. 提取描述文件信息
-          echo ""
-          echo "========================================="
-          echo "📋 描述文件信息:"
-          echo "========================================="
+          # 提取描述文件信息
+          PLIST=$(security cms -D -i "$PROFILE_DIR/ios_profile.mobileprovision" 2>/dev/null)
           
-          # 提取UUID
-          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< \
-            "$(security cms -D -i "$PROFILE_DIR/ios_profile.mobileprovision" 2>/dev/null)")
+          PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< "$PLIST")
+          PROFILE_NAME=$(/usr/libexec/PlistBuddy -c "Print Name" /dev/stdin <<< "$PLIST")
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c "Print TeamIdentifier:0" /dev/stdin <<< "$PLIST")
+          
           echo "UUID: $PROFILE_UUID"
+          echo "Name: $PROFILE_NAME"
+          echo "Team: $TEAM_ID"
           
-          # 提取名称
-          PROFILE_DISPLAY_NAME=$(/usr/libexec/PlistBuddy -c "Print Name" /dev/stdin <<< \
-            "$(security cms -D -i "$PROFILE_DIR/ios_profile.mobileprovision" 2>/dev/null)")
-          echo "Name: $PROFILE_DISPLAY_NAME"
+          # 用UUID命名描述文件
+          cp "$PROFILE_DIR/ios_profile.mobileprovision" \
+             "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
           
-          # 提取TeamID
-          TEAM_ID=$(/usr/libexec/PlistBuddy -c "Print TeamIdentifier:0" /dev/stdin <<< \
-            "$(security cms -D -i "$PROFILE_DIR/ios_profile.mobileprovision" 2>/dev/null)")
-          echo "TeamID: $TEAM_ID"
-          
-          # 提取BundleID
-          APP_ID=$(/usr/libexec/PlistBuddy -c "Print Entitlements:application-identifier" /dev/stdin <<< \
-            "$(security cms -D -i "$PROFILE_DIR/ios_profile.mobileprovision" 2>/dev/null)")
-          echo "AppID: $APP_ID"
-          
-          # 用UUID重命名描述文件（Xcode期望的格式）
-          cp "$PROFILE_DIR/ios_profile.mobileprovision" "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
-          echo "✅ 描述文件已复制为: $PROFILE_UUID.mobileprovision"
-          
-          # 保存变量供后续步骤使用
+          # 保存环境变量
           echo "PROFILE_UUID=$PROFILE_UUID" >> $GITHUB_ENV
-          echo "PROFILE_NAME=$PROFILE_DISPLAY_NAME" >> $GITHUB_ENV
+          echo "PROFILE_NAME=$PROFILE_NAME" >> $GITHUB_ENV
           echo "TEAM_ID=$TEAM_ID" >> $GITHUB_ENV
-
-          # 清理临时文件
-          rm -f /tmp/distribution.p12
           
-          echo ""
-          echo "=== ✅ 证书和描述文件导入完成 ==="
+          rm -f /tmp/distribution.p12
 
-      # ✅ 设置Xcode版本
-      - name: Set up Xcode version
+      - name: Set up Xcode
         run: |
           if [ -d "/Applications/Xcode_16.4.app" ]; then
             sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
           fi
-          echo "Xcode: $(xcodebuild -version)"
+          xcodebuild -version
 
-      # ✅ 创建 ExportOptions.plist（使用动态提取的值）
-      - name: Create Export Options Plist
+      # ✅✅✅ 关键步骤：修改Xcode项目签名配置 ✅✅✅
+      - name: Configure Xcode project signing
         run: |
-          echo "=== 创建 ExportOptions.plist ==="
-          echo "使用 TeamID: $TEAM_ID"
-          echo "使用 Profile Name: $PROFILE_NAME"
-          echo "使用 Profile UUID: $PROFILE_UUID"
+          echo "=== 配置Xcode项目为手动签名 ==="
           
-          # 从Xcode项目中提取Bundle ID
-          BUNDLE_ID=$(grep -A1 'PRODUCT_BUNDLE_IDENTIFIER' ios/Runner.xcodeproj/project.pbxproj \
-            | grep -oE '[a-zA-Z0-9]+(\.[a-zA-Z0-9]+)+' | head -1)
+          PBXPROJ="ios/Runner.xcodeproj/project.pbxproj"
           
-          # 如果提取失败，使用默认值
-          if [ -z "$BUNDLE_ID" ]; then
-            BUNDLE_ID="com.zhiyuexctest.app"
+          # 备份
+          cp "$PBXPROJ" "$PBXPROJ.bak"
+          
+          # 1. 替换所有 Automatic 为 Manual
+          sed -i '' 's/CODE_SIGN_STYLE = Automatic/CODE_SIGN_STYLE = Manual/g' "$PBXPROJ"
+          sed -i '' 's/ProvisioningStyle = Automatic/ProvisioningStyle = Manual/g' "$PBXPROJ"
+          
+          # 2. 替换 DEVELOPMENT_TEAM
+          if grep -q "DEVELOPMENT_TEAM" "$PBXPROJ"; then
+            sed -i '' "s/DEVELOPMENT_TEAM = [^;]*/DEVELOPMENT_TEAM = $TEAM_ID/g" "$PBXPROJ"
           fi
-          echo "使用 BundleID: $BUNDLE_ID"
           
+          # 3. 替换 CODE_SIGN_IDENTITY
+          #    需要同时处理 Debug 和 Release
+          sed -i '' 's/"CODE_SIGN_IDENTITY\[sdk=iphoneos\*\]" = "[^"]*"/"CODE_SIGN_IDENTITY[sdk=iphoneos*]" = "iPhone Distribution"/g' "$PBXPROJ"
+          
+          # 4. 如果项目中有通用的 CODE_SIGN_IDENTITY
+          sed -i '' 's/CODE_SIGN_IDENTITY = "[^"]*"/CODE_SIGN_IDENTITY = "iPhone Distribution"/g' "$PBXPROJ"
+          # 修复可能被过度替换的情况（空字符串的保留）
+          
+          # 5. 添加或替换 PROVISIONING_PROFILE_SPECIFIER
+          if grep -q "PROVISIONING_PROFILE_SPECIFIER" "$PBXPROJ"; then
+            sed -i '' "s/PROVISIONING_PROFILE_SPECIFIER = \"[^\"]*\"/PROVISIONING_PROFILE_SPECIFIER = \"$PROFILE_UUID\"/g" "$PBXPROJ"
+            sed -i '' "s/PROVISIONING_PROFILE_SPECIFIER = \"\"/PROVISIONING_PROFILE_SPECIFIER = \"$PROFILE_UUID\"/g" "$PBXPROJ"
+          fi
+          
+          # 6. 使用Python精确修改（更可靠）
+          python3 << 'PYEOF'
+          import re
+          import os
+          
+          pbxproj_path = "ios/Runner.xcodeproj/project.pbxproj"
+          profile_uuid = os.environ.get("PROFILE_UUID", "")
+          team_id = os.environ.get("TEAM_ID", "")
+          
+          with open(pbxproj_path, 'r') as f:
+              content = f.read()
+          
+          # 确保所有buildSettings块中有正确的签名配置
+          # 查找Release配置块并注入设置
+          
+          # 替换所有 CODE_SIGN_STYLE
+          content = content.replace(
+              'CODE_SIGN_STYLE = Automatic',
+              'CODE_SIGN_STYLE = Manual'
+          )
+          
+          # 替换 ProvisioningStyle
+          content = content.replace(
+              'ProvisioningStyle = Automatic',
+              'ProvisioningStyle = Manual'
+          )
+          
+          # 在每个包含 PRODUCT_BUNDLE_IDENTIFIER 的 buildSettings 块中
+          # 确保有 PROVISIONING_PROFILE_SPECIFIER
+          lines = content.split('\n')
+          new_lines = []
+          in_build_settings = False
+          has_provisioning = False
+          brace_count = 0
+          
+          for i, line in enumerate(lines):
+              new_lines.append(line)
+              
+              if 'buildSettings' in line and '{' in line:
+                  in_build_settings = True
+                  has_provisioning = False
+                  brace_count = 1
+              elif in_build_settings:
+                  brace_count += line.count('{') - line.count('}')
+                  
+                  if 'PROVISIONING_PROFILE_SPECIFIER' in line:
+                      has_provisioning = True
+                  
+                  if brace_count <= 0:
+                      in_build_settings = False
+                      if not has_provisioning:
+                          # 在闭合括号前插入
+                          indent = '\t\t\t\t'
+                          new_lines.insert(-1, f'{indent}PROVISIONING_PROFILE_SPECIFIER = "{profile_uuid}";')
+                          new_lines.insert(-1, f'{indent}"PROVISIONING_PROFILE[sdk=iphoneos*]" = "{profile_uuid}";')
+          
+          content = '\n'.join(new_lines)
+          
+          with open(pbxproj_path, 'w') as f:
+              f.write(content)
+          
+          print(f"✅ 已配置签名: Team={team_id}, Profile={profile_uuid}")
+          PYEOF
+          
+          echo ""
+          echo "验证修改结果:"
+          echo "--- CODE_SIGN_STYLE ---"
+          grep "CODE_SIGN_STYLE" "$PBXPROJ" | head -5
+          echo "--- DEVELOPMENT_TEAM ---"
+          grep "DEVELOPMENT_TEAM" "$PBXPROJ" | head -5
+          echo "--- CODE_SIGN_IDENTITY ---"
+          grep "CODE_SIGN_IDENTITY" "$PBXPROJ" | head -5
+          echo "--- PROVISIONING_PROFILE ---"
+          grep "PROVISIONING_PROFILE" "$PBXPROJ" | head -5
+          echo "--- ProvisioningStyle ---"
+          grep "ProvisioningStyle" "$PBXPROJ" | head -5
+
+      - name: Create Export Options
+        run: |
           cat > ios/ExportOptions.plist << EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -201,61 +225,42 @@ jobs:
           <dict>
               <key>compileBitcode</key>
               <false/>
-              <key>destination</key>
-              <string>export</string>
               <key>method</key>
               <string>app-store</string>
               <key>provisioningProfiles</key>
               <dict>
-                  <key>${BUNDLE_ID}</key>
+                  <key>com.zhiyuexctest.app</key>
                   <string>${PROFILE_NAME}</string>
               </dict>
               <key>signingCertificate</key>
-              <string>Apple Distribution</string>
+              <string>iPhone Distribution</string>
               <key>signingStyle</key>
               <string>manual</string>
               <key>stripSwiftSymbols</key>
               <true/>
               <key>teamID</key>
               <string>${TEAM_ID}</string>
-              <key>thinning</key>
-              <string>&lt;none&gt;</string>
           </dict>
           </plist>
           EOF
           
-          echo ""
-          echo "生成的 ExportOptions.plist:"
           cat ios/ExportOptions.plist
 
-      # ✅ 构建iOS IPA
       - name: Build iOS IPA
         run: |
-          echo "=== 开始构建IPA ==="
-          
-          # 确保钥匙串仍然解锁
+          # 确保钥匙串解锁
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
           
-          # 再次验证证书
-          echo "可用签名证书:"
+          # 验证证书
+          echo "签名证书:"
           security find-identity -v -p codesigning
           
-          # 清理
-          flutter clean
-          flutter pub get
-          
-          # 构建
+          # 构建（不再 flutter clean，前面已经 pub get）
           flutter build ipa \
             --release \
             --export-options-plist=ios/ExportOptions.plist
-          
-          echo ""
-          echo "=== 构建输出 ==="
-          ls -la build/ios/ipa/ 2>/dev/null || echo "未找到IPA目录"
-          find build -name "*.ipa" -type f 2>/dev/null || echo "未找到IPA文件"
 
-      # ✅ 上传IPA文件
-      - name: Upload IPA artifact
+      - name: Upload IPA
         uses: actions/upload-artifact@v4
         if: success()
         with:
@@ -263,9 +268,7 @@ jobs:
           path: build/ios/ipa/*.ipa
           retention-days: 7
 
-      # ✅ 清理钥匙串（始终执行）
-      - name: Cleanup keychain
+      - name: Cleanup
         if: always()
         run: |
           security delete-keychain "$KEYCHAIN_NAME" 2>/dev/null || true
-          rm -f /tmp/distribution.p12
