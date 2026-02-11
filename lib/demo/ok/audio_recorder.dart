@@ -1,15 +1,18 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:audio_session/audio_session.dart';
 import 'package:flutter/foundation.dart';
+import 'package:my_flutter_app/demo/util/my_dual_util.dart';
 import 'package:record/record.dart';
 
 /// PCM 录音数据回调
-typedef OnPcmData = void Function(List<int> samples);
+typedef OnPcmData = void Function(Uint8List samples);
 
 class PcmRecorder {
   final int sampleRate;
   final int channelCount;
+  AudioSession? _audioSession;
 
   final AudioRecorder _recorder = AudioRecorder();
   StreamSubscription<Uint8List>? _subscription;
@@ -26,7 +29,7 @@ class PcmRecorder {
   /// 状态变化回调
   VoidCallback? onStateChanged;
 
-  PcmRecorder({this.sampleRate = 44100, this.channelCount = 1});
+  PcmRecorder({this.sampleRate = 48000, this.channelCount = 1});
 
   /// 请求权限
   Future<bool> hasPermission() async {
@@ -37,6 +40,8 @@ class PcmRecorder {
   Future<void> start() async {
     if (_isRecording) return;
 
+    _audioSession = await AudioSession.instance;
+
     try {
       if (!await hasPermission()) {
         onError?.call('未获得录音权限');
@@ -44,12 +49,17 @@ class PcmRecorder {
       }
 
       debugPrint('[PcmRecorder] 开始录音...');
+      InputDevice? builtInMic = await DualUtil.findBuiltInMicNew(
+        recorder: _recorder,
+        audioSession: _audioSession,
+      );
 
       final stream = await _recorder.startStream(
         RecordConfig(
           encoder: AudioEncoder.pcm16bits,
           sampleRate: sampleRate,
           numChannels: channelCount,
+          device: builtInMic,
         ),
       );
 
@@ -59,14 +69,7 @@ class PcmRecorder {
       _subscription = stream.listen(
         (Uint8List chunk) {
           if (chunk.isEmpty) return;
-
-          // 字节转 Int16 样本
-          final samples = _bytesToInt16Samples(chunk);
-          debugPrint(
-            '[PcmRecorder] 收到 ${chunk.length} 字节 = ${samples.length} 样本',
-          );
-
-          onData?.call(samples);
+          onData?.call(chunk);
         },
         onError: (error) {
           debugPrint('[PcmRecorder] 录音流错误: $error');
@@ -112,25 +115,5 @@ class PcmRecorder {
   void dispose() {
     stop();
     _recorder.dispose();
-  }
-
-  /// 将 PCM16 little-endian 字节转换为 Int16 样本
-  List<int> _bytesToInt16Samples(Uint8List bytes) {
-    final sampleCount = bytes.length ~/ 2;
-    final samples = List<int>.filled(sampleCount, 0);
-
-    for (int i = 0; i < sampleCount; i++) {
-      final low = bytes[i * 2];
-      final high = bytes[i * 2 + 1];
-      int sample = (high << 8) | low;
-
-      // 有符号转换
-      if (sample >= 32768) {
-        sample -= 65536;
-      }
-      samples[i] = sample;
-    }
-
-    return samples;
   }
 }

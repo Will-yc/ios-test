@@ -2,6 +2,7 @@ import 'dart:collection';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
+import 'package:my_flutter_app/demo/util/my_dual_util.dart';
 
 class PcmPlayer {
   final int sampleRate;
@@ -27,9 +28,9 @@ class PcmPlayer {
   ValueChanged<String>? onError;
 
   PcmPlayer({
-    this.sampleRate = 44100,
+    this.sampleRate = 48000,
     this.channelCount = 1,
-    int maxBufferSeconds = 2,
+    int maxBufferSeconds = 1,
   }) : maxBufferSamples = sampleRate * channelCount * maxBufferSeconds;
 
   /// 初始化播放引擎
@@ -54,9 +55,8 @@ class PcmPlayer {
   }
 
   /// 向缓冲区写入样本数据
-  void writeSamples(List<int> samples) {
-    _buffer.addAll(samples);
-
+  void writeSamples(Uint8List chunk) {
+    _buffer.addAll(DualUtil.bytesToInt16Samples(chunk));
     // 限制缓冲区大小，丢弃最旧的数据
     while (_buffer.length > maxBufferSamples) {
       _buffer.removeFirst();

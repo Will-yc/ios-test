@@ -1,0 +1,31 @@
+{
+    // 使用 IntelliSense 了解相关属性。 
+    // 悬停以查看现有属性的描述。
+    // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+        "name": "Flutter: Debug",
+        "type": "dart",
+        "request": "launch",
+        "program": "lib/main.dart",
+        "cwd": "${workspaceFolder}"
+        },
+        {
+        "name": "Flutter: Release",
+        "type": "dart",
+        "request": "launch",
+        "program": "lib/main.dart",
+        "flutterMode": "release",
+        "cwd": "${workspaceFolder}"
+        },
+        {
+        "name": "Flutter: Profile",
+        "type": "dart",
+        "request": "launch",
+        "program": "lib/main.dart",
+        "flutterMode": "profile",
+        "cwd": "${workspaceFolder}"
+        }
+    ]
+}

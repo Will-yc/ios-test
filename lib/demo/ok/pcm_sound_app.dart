@@ -1,6 +1,9 @@
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:my_flutter_app/demo/ok/audio_player.dart';
 import 'package:my_flutter_app/demo/ok/audio_recorder.dart';
+import 'package:my_flutter_app/demo/util/my_dual_resampler_rate.dart';
 
 class PcmSoundApp extends StatefulWidget {
   @override
@@ -8,7 +11,7 @@ class PcmSoundApp extends StatefulWidget {
 }
 
 class _PcmSoundAppState extends State<PcmSoundApp> with WidgetsBindingObserver {
-  static const int _sampleRate = 44100;
+  static const int _sampleRate = 48000;
   static const int _channelCount = 1;
 
   bool _isActive = true;
@@ -34,7 +37,11 @@ class _PcmSoundAppState extends State<PcmSoundApp> with WidgetsBindingObserver {
     _recorder.onStateChanged = _refresh;
 
     // 创建播放器
-    _player = PcmPlayer(sampleRate: _sampleRate, channelCount: _channelCount);
+    _player = PcmPlayer(
+      sampleRate: _sampleRate,
+      channelCount: _channelCount,
+      maxBufferSeconds: 1,
+    );
     _player.onError = _showError;
     _player.onStateChanged = _refresh;
 
@@ -64,8 +71,10 @@ class _PcmSoundAppState extends State<PcmSoundApp> with WidgetsBindingObserver {
   }
 
   /// 录音数据到达 → 写入播放器缓冲区
-  void _onRecordData(List<int> samples) {
-    _player.writeSamples(samples);
+  void _onRecordData(Uint8List chunk) {
+    final Uint8List resampled = MyResamplerRate.resample48kTo16k(chunk);
+
+    _player.writeSamples(resampled);
   }
 
   /// 开始边录边播
