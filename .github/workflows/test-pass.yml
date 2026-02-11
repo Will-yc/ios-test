@@ -17,6 +17,10 @@ jobs:
           echo "$IOS_P12_BASE64" | base64 -D > test_cert.p12
           echo "✅ 证书已解码"
           ls -lh test_cert.p12
+
+          # 用 openssl 验证证书密码
+          echo "验证证书密码..."
+          openssl pkcs12 -in test_cert.p12 -noout -passin pass:"$IOS_P12_PASSWORD" 2>&1
           
           # 2. 创建新的 keychain
           KEYCHAIN_NAME="test.keychain"
