@@ -28,6 +28,29 @@ jobs:
           flutter pub get
           cd ios && pod install --repo-update && cd ..
 
+      # ✅ 检查可用的Xcode版本
+      - name: List available Xcode versions
+        run: |
+          echo "可用的Xcode版本:"
+          ls -d /Applications/Xcode*.app || true
+          
+          # 列出所有可用的Xcode
+          echo "=== 所有可用Xcode ==="
+          ls -la /Applications/ | grep -i xcode || true
+          
+          # 检查特定版本是否存在
+          echo "=== 检查特定版本 ==="
+          [ -d "/Applications/Xcode_15.4.app" ] && echo "✅ Xcode 15.4 存在"
+          [ -d "/Applications/Xcode_15.3.app" ] && echo "✅ Xcode 15.3 存在"
+          [ -d "/Applications/Xcode_15.2.app" ] && echo "✅ Xcode 15.2 存在"
+          [ -d "/Applications/Xcode_15.1.app" ] && echo "✅ Xcode 15.1 存在"
+          [ -d "/Applications/Xcode_15.0.app" ] && echo "✅ Xcode 15.0 存在"
+          [ -d "/Applications/Xcode.app" ] && echo "✅ 默认Xcode 存在"
+          
+          # 显示当前选择的Xcode
+          echo "=== 当前选择的Xcode ==="
+          xcode-select -p
+
       # ✅ 改进的证书导入步骤（使用PEM格式）
       - name: Import iOS signing certificates
         env:
@@ -88,11 +111,45 @@ jobs:
           
           echo "=== 证书导入完成 ==="
 
+      # ✅ 改进的Xcode设置步骤
       - name: Set up Xcode version
         run: |
-          echo "设置Xcode版本..."
-          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+          echo "=== 设置Xcode版本 ==="
+          
+          # 检查可用的Xcode版本并设置
+          if [ -d "/Applications/Xcode_15.4.app" ]; then
+            echo "使用 Xcode 15.4"
+            sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer
+          elif [ -d "/Applications/Xcode_15.3.app" ]; then
+            echo "使用 Xcode 15.3"
+            sudo xcode-select -s /Applications/Xcode_15.3.app/Contents/Developer
+          elif [ -d "/Applications/Xcode_15.2.app" ]; then
+            echo "使用 Xcode 15.2"
+            sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer
+          elif [ -d "/Applications/Xcode_15.1.app" ]; then
+            echo "使用 Xcode 15.1"
+            sudo xcode-select -s /Applications/Xcode_15.1.app/Contents/Developer
+          elif [ -d "/Applications/Xcode_15.0.app" ]; then
+            echo "使用 Xcode 15.0"
+            sudo xcode-select -s /Applications/Xcode_15.0.app/Contents/Developer
+          elif [ -d "/Applications/Xcode.app" ]; then
+            echo "使用默认 Xcode 版本"
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          else
+            echo "❌ 未找到任何Xcode版本"
+            ls -la /Applications/
+            exit 1
+          fi
+          
+          echo "当前Xcode信息:"
+          xcode-select -p
           xcodebuild -version
+
+      # ✅ 可选：使用setup-xcode action来管理Xcode版本
+      # - name: Setup Xcode
+      #   uses: maxim-lobanov/setup-xcode@v1
+      #   with:
+      #     xcode-version: '15.3'  # 或者 'latest', 'stable'
 
       - name: Build iOS IPA
         run: |
