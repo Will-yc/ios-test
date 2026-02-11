@@ -149,8 +149,13 @@ class _PcmSoundAppOpusState extends State<PcmSoundAppOpus>
         }
 
         // 6. 直接写入播放器缓冲区（已经是 16kHz）
-        // 播放器使用 write8Samples，它内部会转换为 Int16
         _player.write8Samples(decodedPcm);
+
+        // 添加小延迟避免缓冲区溢出
+        if (i % 10 == 0) {
+          // 每处理10帧休息一下
+          Future.delayed(Duration(microseconds: 100));
+        }
       }
     } catch (e) {
       debugPrint('编解码处理错误: $e');
