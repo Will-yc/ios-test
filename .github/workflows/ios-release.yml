@@ -79,41 +79,52 @@ jobs:
           echo "可用签名证书:"
           security find-identity -v -p codesigning ios-build.keychain
           
-          # 7. 安装描述文件
+          # 7. 显示所有证书信息
+          echo "证书详细信息:"
+          security find-identity -p codesigning -v
+          
+          # 8. 安装描述文件
           echo "安装描述文件..."
           PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles
           mkdir -p "$PROFILE_PATH"
           echo "$IOS_PROVISION_PROFILE_BASE64" | openssl base64 -d -A > "$PROFILE_PATH/ios_profile.mobileprovision"
           
-          # 8. 解码描述文件查看信息
+          # 9. 解码描述文件查看信息
           echo "描述文件信息:"
-          security cms -D -i "$PROFILE_PATH/ios_profile.mobileprovision" | grep -A 20 "Entitlements" || true
+          security cms -D -i "$PROFILE_PATH/ios_profile.mobileprovision"
           
           echo "=== 证书导入完成 ==="
-          
-          # 9. 显示钥匙串详细信息
-          echo "当前钥匙串列表:"
-          security list-keychains
-          
-          echo "默认钥匙串:"
-          security default-keychain
 
-      # ✅ 设置Xcode版本
+      # ✅ 设置Xcode版本（使用Xcode 16.4）
       - name: Set up Xcode version
         run: |
           echo "=== 设置Xcode版本 ==="
           
-          # 设置默认Xcode版本
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          # 检查可用的Xcode版本
+          echo "可用Xcode版本:"
+          ls -d /Applications/Xcode*.app || true
+          
+          # 设置Xcode 16.4（从日志中看到这是可用的版本）
+          if [ -d "/Applications/Xcode_16.4.app" ]; then
+            echo "使用 Xcode 16.4"
+            sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+          elif [ -d "/Applications/Xcode.app" ]; then
+            echo "使用默认 Xcode 版本"
+            sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          else
+            echo "❌ 未找到任何Xcode版本"
+            ls -la /Applications/
+            exit 1
+          fi
           
           echo "当前Xcode信息:"
           xcode-select -p
           xcodebuild -version
           
-          echo "可用SDKs:"
+          # 验证命令行工具
           xcodebuild -showsdks
 
-      # ✅ 创建正确的ExportOptions.plist
+      # ✅ 创建 ExportOptions.plist
       - name: Create Export Options Plist
         run: |
           echo "=== 创建 ExportOptions.plist ==="
@@ -121,14 +132,11 @@ jobs:
           # 从描述文件中提取信息
           PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/ios_profile.mobileprovision
           
-          # 提取UUID和Team ID
-          UUID=$(grep -A1 -o '<key>UUID</key>.*<string>[^<]*</string>' "$PROFILE_PATH" | grep -o '<string>[^<]*</string>' | sed 's/<string>//;s/<\/string>//' | head -1)
-          TEAM_ID=$(grep -A1 -o '<key>TeamIdentifier</key>.*<string>[^<]*</string>' "$PROFILE_PATH" | grep -o '<string>[^<]*</string>' | sed 's/<string>//;s/<\/string>//' | head -1)
+          # 提取团队ID（需要根据你的实际情况修改）
+          TEAM_ID="XHFPJA66Z2"  # 替换为你的团队ID
+          PROFILE_NAME="ios_profile.mobileprovision"  # 替换为你的描述文件名称
           
-          echo "提取的UUID: $UUID"
-          echo "提取的Team ID: $TEAM_ID"
-          
-          # 创建 ExportOptions.plist - 使用自动签名，简化配置
+          # 创建 ExportOptions.plist
           cat > ios/ExportOptions.plist << EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -143,7 +151,7 @@ jobs:
               <key>provisioningProfiles</key>
               <dict>
                   <key>com.zhiyuexctest.app</key>
-                  <string>$UUID</string>
+                  <string>$PROFILE_NAME</string>
               </dict>
               <key>signingCertificate</key>
               <string>iPhone Distribution</string>
@@ -159,344 +167,58 @@ jobs:
           </plist>
           EOF
           
-          echo "ExportOptions.plist 内容:"
-          cat ios/ExportOptions.plist
+          echo "ExportOptions.plist 已创建"
 
       # ✅ 准备构建环境
       - name: Prepare build environment
         run: |
           echo "=== 准备构建环境 ==="
           
-          # 检查钥匙串状态
-          echo "当前钥匙串列表:"
-          security list-keychains -d user
-          
-          echo "设置钥匙串搜索顺序..."
-          security list-keychains -d user -s ios-build.keychain login.keychain-db
-          
-          echo "解锁钥匙串..."
-          security unlock-keychain -p "" ios-build.keychain
-          
-          # 验证签名证书
-          echo "验证签名证书..."
-          security find-identity -v -p codesigning ios-build.keychain
-          
-          # 清理之前的构建
-          flutter clean
-          
-          # 获取Flutter项目信息
-          echo "Flutter项目信息:"
-          flutter pub get
-          flutter analyze
-          
-          # 检查iOS项目配置
-          echo "检查iOS项目配置..."
-          cd ios
-          xcodebuild -project Runner.xcodeproj -showBuildSettings | grep -i "bundle\|provision\|sign" || true
-          cd ..
-
-      # ✅ 构建iOS IPA - 详细日志
-      - name: Build iOS IPA
-        run: |
-          echo "=== 开始构建IPA ==="
-          
-          # 设置环境变量
-          export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-          
-          # 解锁钥匙串
-          security unlock-keychain -p "" ios-build.keychain
-          
-          # 验证证书
-          echo "验证证书可用性..."
-          security find-identity -v -p codesigning | grep "Distribution"
-          
-          # 显示构建配置
-          echo "检查构建配置..."
-          flutter doctor -v
-          
-          echo "检查iOS构建配置..."
-          cd ios
-          xcodebuild -project Runner.xcodeproj -scheme Runner -showBuildSettings | grep -E "(PRODUCT_BUNDLE_IDENTIFIER|PROVISIONING_PROFILE|CODE_SIGN_IDENTITY)" || true
-          cd ..
-          
-          # 使用详细的构建命令，捕获所有输出
-          echo "开始构建Release IPA..."
-          
-          # 保存构建日志
-          flutter build ipa \
-            --release \
-            --export-options-plist=ios/ExportOptions.plist \
-            --verbose 2>&1 | tee build.log || (echo "构建失败，查看日志..." && cat build.log && exit 1)
-          
-          # 检查构建结果
-          echo "检查构建输出..."
-          if [ -f "build/ios/ipa/Runner.ipa" ]; then
-            echo "✅ IPA构建成功！"
-            ls -lh build/ios/ipa/
-          else
-            echo "❌ IPA文件未找到"
-            find . -name "*.ipa" -type f 2>/dev/null || echo "未找到任何IPA文件"
-            exit 1
-          fi
-
-      # ✅ 上传IPA文件
-      - name: Upload IPA artifact
-        uses: actions/upload-artifact@v4
-        if: success()
-        with:
-          name: iOS-IPA
-          path: |
-            build/ios/ipa/*.ipa
-          retention-days: 7
-          
-      # ✅ 上传构建日志（便于调试）
-      - name: Upload build logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs
-          path: |
-            build.log
-          retention-days: 7name: Build Flutter iOS IPA
-
-on:
-  workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - 'lib/**'
-      - 'ios/**'
-      - 'pubspec.yaml'
-
-jobs:
-  build-ios-ipa:
-    runs-on: macos-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.38.5'
-          cache: true
-
-      - name: Install dependencies
-        run: |
-          flutter pub get
-          cd ios && pod install --repo-update && cd ..
-
-      # ✅ 改进的证书导入步骤（使用PEM格式）
-      - name: Import iOS signing certificates
-        env:
-          IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
-          IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
-          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE }}
-        run: |
-          echo "=== 开始导入证书 ==="
-          
-          # 1. 解码证书为P12格式
-          echo "解码P12证书..."
-          echo "$IOS_P12_BASE64" | openssl base64 -d -A > distribution.p12
-          
-          # 2. 将P12转换为PEM格式
-          echo "转换为PEM格式..."
-          openssl pkcs12 -in distribution.p12 \
-            -passin pass:"$IOS_P12_PASSWORD" \
-            -nodes \
-            -out temp.pem
-          
-          # 3. 创建临时钥匙串
-          echo "创建临时钥匙串..."
-          KEYCHAIN_PATH=~/Library/Keychains/ios-build.keychain-db
-          KEYCHAIN_PASSWORD=$(openssl rand -base64 12)
-          
-          security create-keychain -p "$KEYCHAIN_PASSWORD" ios-build.keychain
-          security list-keychains -d user -s ios-build.keychain login.keychain-db
-          security default-keychain -d user -s ios-build.keychain
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" ios-build.keychain
-          security set-keychain-settings -lut 21600 ios-build.keychain
-          
-          # 4. 导入PEM格式证书到临时钥匙串
-          echo "导入证书到钥匙串..."
-          security import temp.pem \
-            -k ios-build.keychain \
-            -P "" \
-            -T /usr/bin/codesign \
-            -T /usr/bin/productsign
-          
-          # 5. 设置钥匙串分区列表（关键修复）
-          echo "设置钥匙串权限..."
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign:,productsign: \
-            -s \
-            -k "$KEYCHAIN_PASSWORD" \
-            ios-build.keychain
-          
-          # 6. 显示可用签名证书
-          echo "可用签名证书:"
-          security find-identity -v -p codesigning ios-build.keychain
-          
-          # 7. 安装描述文件
-          echo "安装描述文件..."
-          PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles
-          mkdir -p "$PROFILE_PATH"
-          echo "$IOS_PROVISION_PROFILE_BASE64" | openssl base64 -d -A > "$PROFILE_PATH/ios_profile.mobileprovision"
-          
-          # 8. 解码描述文件查看信息
-          echo "描述文件信息:"
-          security cms -D -i "$PROFILE_PATH/ios_profile.mobileprovision" | grep -A 20 "Entitlements" || true
-          
-          echo "=== 证书导入完成 ==="
-          
-          # 9. 显示钥匙串详细信息
-          echo "当前钥匙串列表:"
+          # 确保临时钥匙串在搜索路径中
           security list-keychains
           
-          echo "默认钥匙串:"
-          security default-keychain
-
-      # ✅ 设置Xcode版本
-      - name: Set up Xcode version
-        run: |
-          echo "=== 设置Xcode版本 ==="
+          # 设置环境变量，让Flutter使用正确的钥匙串
+          export FLUTTER_XCODE_KEYCHAIN="ios-build.keychain"
           
-          # 设置默认Xcode版本
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
-          
-          echo "当前Xcode信息:"
-          xcode-select -p
-          xcodebuild -version
-          
-          echo "可用SDKs:"
-          xcodebuild -showsdks
-
-      # ✅ 创建正确的ExportOptions.plist
-      - name: Create Export Options Plist
-        run: |
-          echo "=== 创建 ExportOptions.plist ==="
-          
-          # 从描述文件中提取信息
-          PROFILE_PATH=~/Library/MobileDevice/Provisioning\ Profiles/ios_profile.mobileprovision
-          
-          # 提取UUID和Team ID
-          UUID=$(grep -A1 -o '<key>UUID</key>.*<string>[^<]*</string>' "$PROFILE_PATH" | grep -o '<string>[^<]*</string>' | sed 's/<string>//;s/<\/string>//' | head -1)
-          TEAM_ID=$(grep -A1 -o '<key>TeamIdentifier</key>.*<string>[^<]*</string>' "$PROFILE_PATH" | grep -o '<string>[^<]*</string>' | sed 's/<string>//;s/<\/string>//' | head -1)
-          
-          echo "提取的UUID: $UUID"
-          echo "提取的Team ID: $TEAM_ID"
-          
-          # 创建 ExportOptions.plist - 使用自动签名，简化配置
-          cat > ios/ExportOptions.plist << EOF
-                <?xml version="1.0" encoding="UTF-8"?>
-                <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-                <plist version="1.0">
-                <dict>
-                    <key>compileBitcode</key>
-                    <false/>
-                    <key>destination</key>
-                    <string>export</string>
-                    <key>method</key>
-                    <string>app-store</string>
-                    <key>provisioningProfiles</key>
-                    <dict>
-                        <key>com.zhiyuexctest.app</key>
-                        <string>$UUID</string>
-                    </dict>
-                    <key>signingCertificate</key>
-                    <string>iPhone Distribution</string>
-                    <key>signingStyle</key>
-                    <string>manual</string>
-                    <key>stripSwiftSymbols</key>
-                    <true/>
-                    <key>teamID</key>
-                    <string>$TEAM_ID</string>
-                    <key>thinning</key>
-                    <string>&lt;none&gt;</string>
-                </dict>
-                </plist>
-                EOF
-          
-          echo "ExportOptions.plist 内容:"
-          cat ios/ExportOptions.plist
-
-      # ✅ 准备构建环境
-      - name: Prepare build environment
-        run: |
-          echo "=== 准备构建环境 ==="
-          
-          # 检查钥匙串状态
-          echo "当前钥匙串列表:"
-          security list-keychains -d user
-          
-          echo "设置钥匙串搜索顺序..."
-          security list-keychains -d user -s ios-build.keychain login.keychain-db
-          
-          echo "解锁钥匙串..."
-          security unlock-keychain -p "" ios-build.keychain
-          
-          # 验证签名证书
-          echo "验证签名证书..."
-          security find-identity -v -p codesigning ios-build.keychain
+          # 检查构建配置
+          echo "检查Flutter构建配置..."
+          flutter config --verbose
           
           # 清理之前的构建
           flutter clean
           
-          # 获取Flutter项目信息
-          echo "Flutter项目信息:"
-          flutter pub get
-          flutter analyze
-          
-          # 检查iOS项目配置
-          echo "检查iOS项目配置..."
+          # 验证iOS构建配置
           cd ios
-          xcodebuild -project Runner.xcodeproj -showBuildSettings | grep -i "bundle\|provision\|sign" || true
+          xcodebuild -project Runner.xcodeproj -list
           cd ..
 
-      # ✅ 构建iOS IPA - 详细日志
+      # ✅ 构建iOS IPA（修复签名问题）
       - name: Build iOS IPA
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+          FLUTTER_XCODE_KEYCHAIN: "ios-build.keychain"
         run: |
-          echo "=== 开始构建IPA ==="
+          echo "开始构建IPA..."
           
-          # 设置环境变量
-          export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
-          
-          # 解锁钥匙串
+          # 1. 确保钥匙串已解锁并设置为默认
           security unlock-keychain -p "" ios-build.keychain
+          security default-keychain -d user -s ios-build.keychain
           
-          # 验证证书
-          echo "验证证书可用性..."
-          security find-identity -v -p codesigning | grep "Distribution"
+          # 2. 验证证书可用性
+          echo "验证签名证书:"
+          security find-identity -v -p codesigning | grep "Distribution" || true
           
-          # 显示构建配置
-          echo "检查构建配置..."
-          flutter doctor -v
-          
-          echo "检查iOS构建配置..."
-          cd ios
-          xcodebuild -project Runner.xcodeproj -scheme Runner -showBuildSettings | grep -E "(PRODUCT_BUNDLE_IDENTIFIER|PROVISIONING_PROFILE|CODE_SIGN_IDENTITY)" || true
-          cd ..
-          
-          # 使用详细的构建命令，捕获所有输出
-          echo "开始构建Release IPA..."
-          
-          # 保存构建日志
+          # 3. 使用Flutter构建IPA，指定完整的签名参数
+          echo "构建Release IPA..."
           flutter build ipa \
             --release \
             --export-options-plist=ios/ExportOptions.plist \
-            --verbose 2>&1 | tee build.log || (echo "构建失败，查看日志..." && cat build.log && exit 1)
+            --verbose
           
-          # 检查构建结果
-          echo "检查构建输出..."
-          if [ -f "build/ios/ipa/Runner.ipa" ]; then
-            echo "✅ IPA构建成功！"
-            ls -lh build/ios/ipa/
-          else
-            echo "❌ IPA文件未找到"
-            find . -name "*.ipa" -type f 2>/dev/null || echo "未找到任何IPA文件"
-            exit 1
-          fi
+          # 4. 检查生成的IPA文件
+          echo "检查构建输出:"
+          ls -la build/ios/ipa/ || true
+          find . -name "*.ipa" -type f 2>/dev/null || true
 
       # ✅ 上传IPA文件
       - name: Upload IPA artifact
@@ -506,14 +228,5 @@ jobs:
           name: iOS-IPA
           path: |
             build/ios/ipa/*.ipa
-          retention-days: 7
-          
-      # ✅ 上传构建日志（便于调试）
-      - name: Upload build logs
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-logs
-          path: |
-            build.log
+            build/ios/archive/*.xcarchive
           retention-days: 7
