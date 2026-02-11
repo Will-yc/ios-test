@@ -11,83 +11,30 @@ jobs:
           IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
           IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
         run: |
-          echo "=== 证书导入测试 ==="
+          echo "=== 简单证书导入测试 ==="
           
-          # 1. 使用 openssl 解码证书（兼容性更好）
-          echo "$IOS_P12_BASE64" | openssl base64 -d -A > test_cert.p12
-          echo "✅ 证书已解码"
+          # 1. 解码证书
+          echo "$IOS_P12_BASE64" | openssl base64 -d -A > cert.p12
           
-          # 验证文件是否有效
-          if [ ! -s test_cert.p12 ]; then
-            echo "❌ 解码后的文件为空"
-            exit 1
-          fi
-          
-          ls -lh test_cert.p12
-          
-          # 2. 先用 openssl 验证证书密码是否正确
-          echo "🔐 验证证书密码..."
-          if openssl pkcs12 -in test_cert.p12 -noout -passin pass:"$IOS_P12_PASSWORD" 2>/dev/null; then
-            echo "✅ 证书密码正确"
+          # 2. 测试证书密码
+          echo "测试证书密码..."
+          if openssl pkcs12 -in cert.p12 -nokeys -passin pass:"$IOS_P12_PASSWORD" 2>/dev/null; then
+            echo "✅ 密码正确"
           else
-            echo "❌ 证书密码错误"
-            echo "尝试查看证书信息..."
-            openssl pkcs12 -in test_cert.p12 -info -nodes -passin pass:"$IOS_P12_PASSWORD" 2>&1 | head -20
+            echo "❌ 密码错误"
             exit 1
           fi
           
-          # 3. 创建新的 keychain
-          KEYCHAIN_NAME="test.keychain"
-          KEYCHAIN_PASSWORD="test123"
-          
-          echo "🔑 创建钥匙串..."
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
-          security list-keychains -d user -s "$KEYCHAIN_NAME" $(security list-keychains -d user | tr -d '"')
-          security default-keychain -d user -s "$KEYCHAIN_NAME"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
-          
-          # 设置 keychain 超时（避免锁定）
-          security set-keychain-settings -t 3600 -u "$KEYCHAIN_NAME"
-          
-          # 4. 导入证书
-          echo "📤 导入证书..."
-          
-          # 方法1：使用 openssl 转换为 PEM 再导入
-          echo "方法1：通过 openssl 转换导入"
-          openssl pkcs12 -in test_cert.p12 \
-            -passin pass:"$IOS_P12_PASSWORD" \
-            -passout pass:"$KEYCHAIN_PASSWORD" \
-            -out cert_temp.pem 2>/dev/null
-          
-          # 导入私钥和证书到 keychain
-          security import cert_temp.pem \
-            -k "$KEYCHAIN_NAME" \
-            -P "$KEYCHAIN_PASSWORD" \
-            -T /usr/bin/codesign 2>&1
-          
-          # 方法2：直接导入（备选）
-          echo "方法2：直接导入 PKCS12"
-          security import test_cert.p12 \
-            -k "$KEYCHAIN_NAME" \
+          # 3. 导入到默认钥匙串
+          echo "导入证书..."
+          security import cert.p12 \
             -P "$IOS_P12_PASSWORD" \
             -T /usr/bin/codesign \
-            -A 2>&1
+            -T /usr/bin/productsign \
+            -T /usr/bin/security 2>&1
           
-          # 5. 列出证书
-          echo "📋 钥匙串中的证书:"
-          security find-identity -v -p codesigning "$KEYCHAIN_NAME"
+          # 4. 查看结果
+          echo "可用签名证书:"
+          security find-identity -v -p codesigning
           
-          # 6. 检查证书类型
-          echo "🔍 证书详细信息:"
-          security find-certificate -a "$KEYCHAIN_NAME" | while read line; do
-            if [[ "$line" == *"iPhone"* ]] || [[ "$line" == *"Apple"* ]] || [[ "$line" == *"Developer"* ]]; then
-              cert_name=$(echo "$line" | cut -d'"' -f4)
-              echo "找到证书: $cert_name"
-              security find-certificate -c "$cert_name" -p "$KEYCHAIN_NAME" | openssl x509 -text -noout | grep -E "Subject:|Not Before|Not After" 2>/dev/null || true
-            fi
-          done
-          
-          # 7. 清理临时文件
-          rm -f test_cert.p12 cert_temp.pem
-          
-          echo "=== 测试完成 ==="
+          echo "=== 完成 ==="
