@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:my_flutter_app/demo/RealTimeAudioPlayerPage1Htpp.dart';
 import 'package:my_flutter_app/demo/RealTimeAudioPlayerPage1Stream.dart';
 import 'package:my_flutter_app/demo/flutterpcm.dart';
+import 'package:my_flutter_app/demo/ok/pcm_sound_app_opus.dart';
 import 'package:my_flutter_app/demo/opus_test_demo.dart';
 
 void main() {
@@ -112,7 +113,7 @@ class NavigationPage extends StatelessWidget {
                     Icon(Icons.stream, color: Colors.white),
                     SizedBox(width: 10),
                     Text(
-                      '实时音频播放 (流式)',
+                      '实时音频播放 (pcm重采样)',
                       style: TextStyle(fontSize: 18, color: Colors.white),
                     ),
                   ],
@@ -127,9 +128,7 @@ class NavigationPage extends StatelessWidget {
                 onPressed: () {
                   Navigator.push(
                     context,
-                    MaterialPageRoute(
-                      builder: (context) => RealTimeAudioPlayerHttpPage(),
-                    ),
+                    MaterialPageRoute(builder: (context) => PcmSoundAppOpus()),
                   );
                 },
                 style: ElevatedButton.styleFrom(
@@ -145,7 +144,7 @@ class NavigationPage extends StatelessWidget {
                     Icon(Icons.http, color: Colors.white),
                     SizedBox(width: 10),
                     Text(
-                      '实时音频播放 (HTTP)',
+                      '实时音频播放 (opus)',
                       style: TextStyle(fontSize: 18, color: Colors.white),
                     ),
                   ],

@@ -74,7 +74,7 @@ class _PcmSoundAppState extends State<PcmSoundApp> with WidgetsBindingObserver {
   void _onRecordData(Uint8List chunk) {
     final Uint8List resampled = MyResamplerRate.resample48kTo16k(chunk);
 
-    _player.writeSamples(resampled);
+    _player.write8Samples(resampled);
   }
 
   /// 开始边录边播

@@ -55,8 +55,16 @@ class PcmPlayer {
   }
 
   /// 向缓冲区写入样本数据
-  void writeSamples(Uint8List chunk) {
+  void write8Samples(Uint8List chunk) {
     _buffer.addAll(DualUtil.bytesToInt16Samples(chunk));
+    // 限制缓冲区大小，丢弃最旧的数据
+    while (_buffer.length > maxBufferSamples) {
+      _buffer.removeFirst();
+    }
+  }
+
+  void write16Samples(List<int> chunk) {
+    _buffer.addAll(chunk);
     // 限制缓冲区大小，丢弃最旧的数据
     while (_buffer.length > maxBufferSamples) {
       _buffer.removeFirst();
