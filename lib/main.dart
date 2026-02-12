@@ -1,11 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:my_flutter_app/demo/RealTimeAudioPlayerPage1Htpp.dart';
-import 'package:my_flutter_app/demo/RealTimeAudioPlayerPage1Stream.dart';
-import 'package:my_flutter_app/demo/flutterpcm.dart';
-import 'package:my_flutter_app/demo/ok/pcm_sound_app_opus.dart';
 import 'package:my_flutter_app/demo/test_opus.dart';
-import 'package:my_flutter_app/opusdemo/opus_encoder_demo.dart';
-import 'package:my_flutter_app/opusdemo/opus_decoder_test.dart';
 
 void main() {
   runApp(const MyApp());
@@ -59,40 +53,6 @@ class NavigationPage extends StatelessWidget {
             ),
             const SizedBox(height: 40),
 
-            // 第一个页面按钮
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => const OpusRoundTripPage(),
-                    ),
-                  );
-                },
-                style: ElevatedButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 60),
-                  backgroundColor: Colors.blueAccent,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                child: const Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.code, color: Colors.white),
-                    SizedBox(width: 10),
-                    Text(
-                      'Opus 编解码演示',
-                      style: TextStyle(fontSize: 18, color: Colors.white),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            // 第二个页面按钮
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
               child: ElevatedButton(
@@ -125,73 +85,12 @@ class NavigationPage extends StatelessWidget {
               ),
             ),
 
-            // 第二个页面按钮
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(builder: (context) => PcmSoundApp()),
-                  );
-                },
-                style: ElevatedButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 60),
-                  backgroundColor: Colors.greenAccent,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                child: const Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.stream, color: Colors.white),
-                    SizedBox(width: 10),
-                    Text(
-                      '实时音频播放 (pcm重采样)',
-                      style: TextStyle(fontSize: 18, color: Colors.white),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
-            // 第三个页面按钮
-            // Padding(
-            //   padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
-            //   child: ElevatedButton(
-            //     onPressed: () {
-            //       Navigator.push(
-            //         context,
-            //         MaterialPageRoute(builder: (context) => PcmSoundAppOpus()),
-            //       );
-            //     },
-            //     style: ElevatedButton.styleFrom(
-            //       minimumSize: const Size(double.infinity, 60),
-            //       backgroundColor: Colors.orangeAccent,
-            //       shape: RoundedRectangleBorder(
-            //         borderRadius: BorderRadius.circular(12),
-            //       ),
-            //     ),
-            //     child: const Row(
-            //       mainAxisAlignment: MainAxisAlignment.center,
-            //       children: [
-            //         Icon(Icons.http, color: Colors.white),
-            //         SizedBox(width: 10),
-            //         Text(
-            //           '实时音频播放 (opus)',
-            //           style: TextStyle(fontSize: 18, color: Colors.white),
-            //         ),
-            //       ],
-            //     ),
-            //   ),
-            // ),
             const SizedBox(height: 30),
             const Divider(height: 20, thickness: 1),
             const Padding(
               padding: EdgeInsets.all(16.0),
               child: Text(
-                '这是一个音频功能演示应用，包含三种不同的音频处理功能。',
+                '这是一个音频功能演示应用',
                 textAlign: TextAlign.center,
                 style: TextStyle(color: Colors.grey),
               ),
