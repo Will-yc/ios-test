@@ -1,11 +1,11 @@
 // import 'dart:typed_data';
 
 // import 'package:flutter/material.dart';
-// import 'package:flutter_opus/flutter_opus.dart';
 // import 'package:my_flutter_app/demo/ok/audio_player.dart';
 // import 'package:my_flutter_app/demo/ok/audio_recorder.dart';
 // import 'package:my_flutter_app/demo/util/my_dual_resampler_rate.dart';
 // import 'package:my_flutter_app/demo/util/my_dual_util.dart';
+// import 'package:opus_ffi/opus_ffi.dart';
 
 // class PcmSoundAppOpus extends StatefulWidget {
 //   @override
@@ -22,14 +22,22 @@
 //   static const int frameSize = 320; // 20ms @ 16kHz
 
 //   // Opus 编解码器（16kHz）
-//   final encoder = OpusEncoder.create(
+//   final encoder = OpusDecoder(
+//     channels: Channels.mono,
 //     sampleRate: _opusSampleRate,
-//     channels: _channelCount,
 //   );
-//   final decoder = OpusDecoder.create(
+//   // OpusEncoder.create(
+//   //   sampleRate: _opusSampleRate,
+//   //   channels: _channelCount,
+//   // );
+//   final decoder = OpusEncoder(
+//     channels: Channels.mono,
 //     sampleRate: _opusSampleRate,
-//     channels: _channelCount,
 //   );
+//   // OpusDecoder.create(
+//   //   sampleRate: _opusSampleRate,
+//   //   channels: _channelCount,
+//   // );
 
 //   bool _isActive = true;
 
@@ -65,11 +73,7 @@
 //     // 初始化播放引擎
 //     _player.init();
 
-//     // 设置 Opus 编码器参数
-//     if (encoder != null) {
-//       encoder!.setBitrate(64000);
-//       encoder!.setComplexity(5);
-//     }
+//     // 设
 //   }
 
 //   @override
@@ -79,8 +83,8 @@
 //     _player.dispose();
 
 //     // 释放 Opus 资源
-//     encoder?.dispose();
-//     decoder?.dispose();
+//     encoder.dispose();
+//     decoder.dispose();
 
 //     super.dispose();
 //   }
@@ -100,10 +104,6 @@
 
 //   /// 录音数据到达 → Opus 编解码 → 写入播放器
 //   void _onRecordData(Uint8List chunk) {
-//     if (encoder == null || decoder == null) {
-//       debugPrint('Opus 编解码器未初始化');
-//       return;
-//     }
 
 //     try {
 //       // 1. 将录音数据从 48kHz 重采样到 16kHz
@@ -132,7 +132,7 @@
 //         final Int16List pcmDataForEncode = Int16List.fromList(frameSamples);
 
 //         // 4. Opus 编码
-//         final Uint8List? encodedData = encoder!.encode(
+//         final Uint8List? encodedData = encoder.encode(
 //           pcmDataForEncode,
 //           frameSize,
 //         );

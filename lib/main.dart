@@ -3,8 +3,9 @@ import 'package:my_flutter_app/demo/RealTimeAudioPlayerPage1Htpp.dart';
 import 'package:my_flutter_app/demo/RealTimeAudioPlayerPage1Stream.dart';
 import 'package:my_flutter_app/demo/flutterpcm.dart';
 import 'package:my_flutter_app/demo/ok/pcm_sound_app_opus.dart';
-import 'package:my_flutter_app/opusdemo/opus_test_demo.dart';
-import 'package:my_flutter_app/opusdemo/opustest.dart';
+import 'package:my_flutter_app/demo/test_opus.dart';
+import 'package:my_flutter_app/opusdemo/opus_encoder_demo.dart';
+import 'package:my_flutter_app/opusdemo/opus_decoder_test.dart';
 
 void main() {
   runApp(const MyApp());
@@ -66,7 +67,7 @@ class NavigationPage extends StatelessWidget {
                   Navigator.push(
                     context,
                     MaterialPageRoute(
-                      builder: (context) => const OpusDecoderPage(),
+                      builder: (context) => const OpusRoundTripPage(),
                     ),
                   );
                 },
@@ -84,6 +85,39 @@ class NavigationPage extends StatelessWidget {
                     SizedBox(width: 10),
                     Text(
                       'Opus 编解码演示',
+                      style: TextStyle(fontSize: 18, color: Colors.white),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // 第二个页面按钮
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
+              child: ElevatedButton(
+                onPressed: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => OpusLiveStreamPage(),
+                    ),
+                  );
+                },
+                style: ElevatedButton.styleFrom(
+                  minimumSize: const Size(double.infinity, 60),
+                  backgroundColor: Colors.greenAccent,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                child: const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.stream, color: Colors.white),
+                    SizedBox(width: 10),
+                    Text(
+                      '实时音频播放opus',
                       style: TextStyle(fontSize: 18, color: Colors.white),
                     ),
                   ],

@@ -48,6 +48,15 @@ class PcmDataSaver {
     }
   }
 
+  Future<void> openExt() async {
+    try {
+      _raf = await _file.open(mode: FileMode.write);
+    } catch (e) {
+      await delete();
+      rethrow;
+    }
+  }
+
   /// 写入数据
   Future<void> write(List<int> data) async {
     try {
