@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
+import 'package:my_flutter_app/demo/util/my_dual_resampler_rate.dart';
 import 'package:record/record.dart' hide IosAudioCategory;
 import 'package:opus_ffi/opus_ffi.dart';
 
@@ -21,8 +22,10 @@ class _OpusLiveStreamPageState extends State<OpusLiveStreamPage> {
   // Opus 参数
   late OpusEncoder _encoder;
   late OpusDecoder _decoder;
-  final int _sampleRate = 48000;
-  final int _frameSize = 960; // 20ms @ 48kHz
+  static const int _recordSampleRate = 48000;
+  static const int _channelCount = 1;
+  static const int _opusSampleRate = 16000;
+  final int _frameSize = 320; // 20ms @ 48kHz
 
   // 字节缓冲区：用于暂存从 recorder 出来的原始 Uint8List
   final List<int> _accumulationBuffer = [];
@@ -33,11 +36,14 @@ class _OpusLiveStreamPageState extends State<OpusLiveStreamPage> {
     super.initState();
     // 1. 初始化编解码器
     _encoder = OpusEncoder(
-      sampleRate: _sampleRate,
+      sampleRate: _opusSampleRate,
       channels: Channels.mono,
       application: Application.voip,
     );
-    _decoder = OpusDecoder(sampleRate: _sampleRate, channels: Channels.mono);
+    _decoder = OpusDecoder(
+      sampleRate: _opusSampleRate,
+      channels: Channels.mono,
+    );
   }
 
   Future<void> _toggleStream() async {
@@ -52,9 +58,10 @@ class _OpusLiveStreamPageState extends State<OpusLiveStreamPage> {
     if (!await _recorder.hasPermission()) return;
 
     // 2. 初始化播放器设置 (根据你提供的源码)
+    FlutterPcmSound.setLogLevel(LogLevel.none);
     await FlutterPcmSound.setup(
-      sampleRate: _sampleRate,
-      channelCount: 1,
+      sampleRate: _opusSampleRate,
+      channelCount: _channelCount,
       iosAudioCategory: IosAudioCategory.playAndRecord, // 录播模式
     );
 
@@ -62,15 +69,19 @@ class _OpusLiveStreamPageState extends State<OpusLiveStreamPage> {
     final stream = await _recorder.startStream(
       const RecordConfig(
         encoder: AudioEncoder.pcm16bits,
-        sampleRate: 48000,
-        numChannels: 1,
+        sampleRate: _recordSampleRate,
+        numChannels: _channelCount,
       ),
     );
 
     setState(() => _isRunning = true);
 
     _subscription = stream.listen((Uint8List chunk) {
-      _accumulationBuffer.addAll(chunk);
+      final Uint8List resampled48kTo16k = MyResamplerRate.resample48kTo16k(
+        chunk,
+      );
+
+      _accumulationBuffer.addAll(resampled48kTo16k);
 
       // 4. 帧对齐逻辑：Opus 每一帧必须是固定长度
       // 16bit = 2字节。所以 960 采样 = 1920 字节
