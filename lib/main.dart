@@ -3,7 +3,8 @@ import 'package:my_flutter_app/demo/RealTimeAudioPlayerPage1Htpp.dart';
 import 'package:my_flutter_app/demo/RealTimeAudioPlayerPage1Stream.dart';
 import 'package:my_flutter_app/demo/flutterpcm.dart';
 import 'package:my_flutter_app/demo/ok/pcm_sound_app_opus.dart';
-import 'package:my_flutter_app/demo/opus_test_demo.dart';
+import 'package:my_flutter_app/opusdemo/opus_test_demo.dart';
+import 'package:my_flutter_app/opusdemo/opustest.dart';
 
 void main() {
   runApp(const MyApp());
@@ -65,7 +66,7 @@ class NavigationPage extends StatelessWidget {
                   Navigator.push(
                     context,
                     MaterialPageRoute(
-                      builder: (context) => const OpusDemoPage(),
+                      builder: (context) => const OpusDecoderPage(),
                     ),
                   );
                 },
@@ -122,36 +123,35 @@ class NavigationPage extends StatelessWidget {
             ),
 
             // 第三个页面按钮
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
-              child: ElevatedButton(
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(builder: (context) => PcmSoundAppOpus()),
-                  );
-                },
-                style: ElevatedButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 60),
-                  backgroundColor: Colors.orangeAccent,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                child: const Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.http, color: Colors.white),
-                    SizedBox(width: 10),
-                    Text(
-                      '实时音频播放 (opus)',
-                      style: TextStyle(fontSize: 18, color: Colors.white),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-
+            // Padding(
+            //   padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
+            //   child: ElevatedButton(
+            //     onPressed: () {
+            //       Navigator.push(
+            //         context,
+            //         MaterialPageRoute(builder: (context) => PcmSoundAppOpus()),
+            //       );
+            //     },
+            //     style: ElevatedButton.styleFrom(
+            //       minimumSize: const Size(double.infinity, 60),
+            //       backgroundColor: Colors.orangeAccent,
+            //       shape: RoundedRectangleBorder(
+            //         borderRadius: BorderRadius.circular(12),
+            //       ),
+            //     ),
+            //     child: const Row(
+            //       mainAxisAlignment: MainAxisAlignment.center,
+            //       children: [
+            //         Icon(Icons.http, color: Colors.white),
+            //         SizedBox(width: 10),
+            //         Text(
+            //           '实时音频播放 (opus)',
+            //           style: TextStyle(fontSize: 18, color: Colors.white),
+            //         ),
+            //       ],
+            //     ),
+            //   ),
+            // ),
             const SizedBox(height: 30),
             const Divider(height: 20, thickness: 1),
             const Padding(
