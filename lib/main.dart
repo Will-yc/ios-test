@@ -1,5 +1,10 @@
+import 'dart:ffi';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:my_flutter_app/demo/test_opus.dart';
+
+import 'package:ffi/ffi.dart';
 
 void main() {
   runApp(const MyApp());
@@ -16,13 +21,23 @@ class MyApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
         useMaterial3: true,
       ),
-      home: const NavigationPage(), // 修改为导航页面
+      home: NavigationPage(), // 修改为导航页面
     );
   }
 }
 
 class NavigationPage extends StatelessWidget {
-  const NavigationPage({super.key});
+  NavigationPage({super.key});
+
+  // 加载动态库
+  final dylib = Platform.isAndroid
+      ? DynamicLibrary.open('libnative_add.so')
+      : DynamicLibrary.process(); // 仅演示，iOS 需单独处理
+
+  // 查找函数并转换为 Dart 函数类型
+  int Function(int, int) get addFunc => dylib
+      .lookup<NativeFunction<Int32 Function(Int32, Int32)>>('add')
+      .asFunction<int Function(int, int)>();
 
   @override
   Widget build(BuildContext context) {
@@ -35,24 +50,6 @@ class NavigationPage extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const SizedBox(height: 20),
-            const Icon(Icons.audiotrack, size: 80, color: Colors.deepPurple),
-            const SizedBox(height: 20),
-            const Text(
-              '音频演示应用',
-              style: TextStyle(
-                fontSize: 28,
-                fontWeight: FontWeight.bold,
-                color: Colors.deepPurple,
-              ),
-            ),
-            const SizedBox(height: 10),
-            const Text(
-              '请选择要进入的功能页面',
-              style: TextStyle(fontSize: 16, color: Colors.grey),
-            ),
-            const SizedBox(height: 40),
-
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
               child: ElevatedButton(
@@ -65,7 +62,6 @@ class NavigationPage extends StatelessWidget {
                   );
                 },
                 style: ElevatedButton.styleFrom(
-                  minimumSize: const Size(double.infinity, 60),
                   backgroundColor: Colors.greenAccent,
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
@@ -78,6 +74,33 @@ class NavigationPage extends StatelessWidget {
                     SizedBox(width: 10),
                     Text(
                       '实时音频播放opus',
+                      style: TextStyle(fontSize: 18, color: Colors.white),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
+              child: ElevatedButton(
+                onPressed: () {
+                  final result = addFunc(42, 8);
+                  print('42 + 8 = $result');
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.greenAccent,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                child: const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.stream, color: Colors.white),
+                    SizedBox(width: 10),
+                    Text(
+                      '测试ffi',
                       style: TextStyle(fontSize: 18, color: Colors.white),
                     ),
                   ],
@@ -101,57 +124,3 @@ class NavigationPage extends StatelessWidget {
     );
   }
 }
-
-// 如果你的其他页面还没有创建，这里提供了一个简单的模板
-// 实际使用时，你需要创建对应的页面文件
-
-// class OpusDemoPage extends StatefulWidget {
-//   const OpusDemoPage({super.key});
-// 
-//   @override
-//   State<OpusDemoPage> createState() => _OpusDemoPageState();
-// }
-// 
-// class _OpusDemoPageState extends State<OpusDemoPage> {
-//   @override
-//   Widget build(BuildContext context) {
-//     return Scaffold(
-//       appBar: AppBar(title: const Text('Opus 编解码演示')),
-//       body: const Center(child: Text('Opus 编解码演示页面')),
-//     );
-//   }
-// }
-// 
-// class RealTimeAudioPlayerStreamPage extends StatefulWidget {
-//   const RealTimeAudioPlayerStreamPage({super.key});
-// 
-//   @override
-//   State<RealTimeAudioPlayerStreamPage> createState() => _RealTimeAudioPlayerStreamPageState();
-// }
-// 
-// class _RealTimeAudioPlayerStreamPageState extends State<RealTimeAudioPlayerStreamPage> {
-//   @override
-//   Widget build(BuildContext context) {
-//     return Scaffold(
-//       appBar: AppBar(title: const Text('实时音频播放 (流式)')),
-//       body: const Center(child: Text('实时音频播放 (流式) 页面')),
-//     );
-//   }
-// }
-// 
-// class RealTimeAudioPlayerHttpPage extends StatefulWidget {
-//   const RealTimeAudioPlayerHttpPage({super.key});
-// 
-//   @override
-//   State<RealTimeAudioPlayerHttpPage> createState() => _RealTimeAudioPlayerHttpPageState();
-// }
-// 
-// class _RealTimeAudioPlayerHttpPageState extends State<RealTimeAudioPlayerHttpPage> {
-//   @override
-//   Widget build(BuildContext context) {
-//     return Scaffold(
-//       appBar: AppBar(title: const Text('实时音频播放 (HTTP)')),
-//       body: const Center(child: Text('实时音频播放 (HTTP) 页面')),
-//     );
-//   }
-// }
