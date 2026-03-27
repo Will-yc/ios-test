@@ -6,8 +6,6 @@ import 'package:my_flutter_app/demo/util/my_dual_resampler_rate.dart';
 import 'package:record/record.dart' hide IosAudioCategory;
 import 'package:opus_ffi/opus_ffi.dart';
 
-// 假设 FlutterPcmSound 和 PcmArrayInt16 类就在当前文件或已导入
-
 class OpusLiveStreamPage extends StatefulWidget {
   const OpusLiveStreamPage({super.key});
 
@@ -18,6 +16,10 @@ class OpusLiveStreamPage extends StatefulWidget {
 class _OpusLiveStreamPageState extends State<OpusLiveStreamPage> {
   final AudioRecorder _recorder = AudioRecorder();
   StreamSubscription? _subscription;
+
+  final StreamController<Uint8List> _opusController =
+      StreamController<Uint8List>.broadcast();
+  Stream<Uint8List> get opusStream => _opusController.stream;
 
   // Opus 参数
   late OpusEncoder _encoder;
@@ -34,6 +36,10 @@ class _OpusLiveStreamPageState extends State<OpusLiveStreamPage> {
   @override
   void initState() {
     super.initState();
+    init();
+  }
+
+  void init() async {
     // 1. 初始化编解码器
     _encoder = OpusEncoder(
       sampleRate: _opusSampleRate,
@@ -44,6 +50,17 @@ class _OpusLiveStreamPageState extends State<OpusLiveStreamPage> {
       sampleRate: _opusSampleRate,
       channels: Channels.mono,
     );
+    // FlutterPcmSound.setLogLevel(LogLevel.none);
+    await FlutterPcmSound.setup(
+      sampleRate: _opusSampleRate,
+      channelCount: _channelCount,
+      iosAudioCategory: IosAudioCategory.playAndRecord, // 录播模式
+    );
+    opusStream.listen((opusPacket) {
+      final decodedPcm = _decoder.decode(opusPacket);
+      final pcmArray = PcmArrayInt16(bytes: decodedPcm.buffer.asByteData());
+      FlutterPcmSound.feed(pcmArray);
+    });
   }
 
   Future<void> _toggleStream() async {
@@ -58,12 +75,6 @@ class _OpusLiveStreamPageState extends State<OpusLiveStreamPage> {
     if (!await _recorder.hasPermission()) return;
 
     // 2. 初始化播放器设置 (根据你提供的源码)
-    FlutterPcmSound.setLogLevel(LogLevel.none);
-    await FlutterPcmSound.setup(
-      sampleRate: _opusSampleRate,
-      channelCount: _channelCount,
-      iosAudioCategory: IosAudioCategory.playAndRecord, // 录播模式
-    );
 
     // 3. 启动录音流
     final stream = await _recorder.startStream(
@@ -83,27 +94,14 @@ class _OpusLiveStreamPageState extends State<OpusLiveStreamPage> {
 
       _accumulationBuffer.addAll(resampled48kTo16k);
 
-      // 4. 帧对齐逻辑：Opus 每一帧必须是固定长度
-      // 16bit = 2字节。所以 960 采样 = 1920 字节
       while (_accumulationBuffer.length >= _frameSize * 2) {
         final frameBytes = Uint8List.fromList(
           _accumulationBuffer.sublist(0, _frameSize * 2),
         );
         _accumulationBuffer.removeRange(0, _frameSize * 2);
-
-        // --- 编码 (PCM -> Opus) ---
-        // 使用 view 避免内存拷贝
         final pcmInput = Int16List.view(frameBytes.buffer);
         final opusPacket = _encoder.encode(pcmInput, inputSize: _frameSize);
-
-        // --- 模拟传输 / 解码 (Opus -> PCM) ---
-        final decodedPcm = _decoder.decode(opusPacket);
-
-        // 5. 播放 (对接你提供的 PcmArrayInt16 结构)
-        // 效率最高的方法：直接通过 buffer 构造 ByteData
-        final pcmArray = PcmArrayInt16(bytes: decodedPcm.buffer.asByteData());
-
-        FlutterPcmSound.feed(pcmArray);
+        _opusController.add(opusPacket);
       }
     });
   }

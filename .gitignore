@@ -4,7 +4,7 @@ build
 linux
 macos
 windows
-
+.dart_tool
 .gradle
 /build/
 !gradle/wrapper/gradle-wrapper.jar
@@ -38,6 +38,7 @@ nbbuild/
 dist/
 nbdist/
 .nb-gradle/
+.dart_tool
 
 ######################################################################
 # Others

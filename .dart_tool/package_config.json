@@ -14,6 +14,48 @@
       "languageVersion": "3.4"
     },
     {
+      "name": "audioplayers",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/audioplayers-6.5.1",
+      "packageUri": "lib/",
+      "languageVersion": "3.6"
+    },
+    {
+      "name": "audioplayers_android",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/audioplayers_android-5.2.1",
+      "packageUri": "lib/",
+      "languageVersion": "3.6"
+    },
+    {
+      "name": "audioplayers_darwin",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/audioplayers_darwin-6.3.0",
+      "packageUri": "lib/",
+      "languageVersion": "3.6"
+    },
+    {
+      "name": "audioplayers_linux",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/audioplayers_linux-4.2.1",
+      "packageUri": "lib/",
+      "languageVersion": "3.6"
+    },
+    {
+      "name": "audioplayers_platform_interface",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/audioplayers_platform_interface-7.1.1",
+      "packageUri": "lib/",
+      "languageVersion": "3.6"
+    },
+    {
+      "name": "audioplayers_web",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/audioplayers_web-5.1.1",
+      "packageUri": "lib/",
+      "languageVersion": "3.6"
+    },
+    {
+      "name": "audioplayers_windows",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/audioplayers_windows-4.2.1",
+      "packageUri": "lib/",
+      "languageVersion": "3.6"
+    },
+    {
       "name": "boolean_selector",
       "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/boolean_selector-2.1.2",
       "packageUri": "lib/",
@@ -44,6 +86,12 @@
       "languageVersion": "3.4"
     },
     {
+      "name": "cross_file",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/cross_file-0.3.5+2",
+      "packageUri": "lib/",
+      "languageVersion": "3.8"
+    },
+    {
       "name": "crypto",
       "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/crypto-3.0.7",
       "packageUri": "lib/",
@@ -68,6 +116,12 @@
       "languageVersion": "3.7"
     },
     {
+      "name": "fftea",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/fftea-1.5.0+1",
+      "packageUri": "lib/",
+      "languageVersion": "2.14"
+    },
+    {
       "name": "file",
       "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/file-7.0.1",
       "packageUri": "lib/",
@@ -86,22 +140,28 @@
       "languageVersion": "3.8"
     },
     {
+      "name": "flutter_easyloading",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/flutter_easyloading-3.0.5",
+      "packageUri": "lib/",
+      "languageVersion": "2.12"
+    },
+    {
       "name": "flutter_lints",
       "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/flutter_lints-6.0.0",
       "packageUri": "lib/",
       "languageVersion": "3.8"
     },
     {
-      "name": "flutter_opus",
-      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/flutter_opus-1.0.4",
-      "packageUri": "lib/",
-      "languageVersion": "3.6"
-    },
-    {
       "name": "flutter_pcm_sound",
       "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/flutter_pcm_sound-3.3.3",
       "packageUri": "lib/",
       "languageVersion": "2.15"
+    },
+    {
+      "name": "flutter_spinkit",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/flutter_spinkit-5.2.2",
+      "packageUri": "lib/",
+      "languageVersion": "2.12"
     },
     {
       "name": "flutter_test",
@@ -126,6 +186,12 @@
       "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/hooks-1.0.1",
       "packageUri": "lib/",
       "languageVersion": "3.9"
+    },
+    {
+      "name": "http",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/http-1.6.0",
+      "packageUri": "lib/",
+      "languageVersion": "3.4"
     },
     {
       "name": "http_parser",
@@ -200,6 +266,18 @@
       "languageVersion": "3.5"
     },
     {
+      "name": "mic_info",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/mic_info-0.0.6",
+      "packageUri": "lib/",
+      "languageVersion": "3.4"
+    },
+    {
+      "name": "mime",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/mime-1.0.6",
+      "packageUri": "lib/",
+      "languageVersion": "3.2"
+    },
+    {
       "name": "native_toolchain_c",
       "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/native_toolchain_c-0.17.4",
       "packageUri": "lib/",
@@ -210,6 +288,12 @@
       "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/objective_c-9.3.0",
       "packageUri": "lib/",
       "languageVersion": "3.10"
+    },
+    {
+      "name": "opus_ffi",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/opus_ffi-0.1.4",
+      "packageUri": "lib/",
+      "languageVersion": "3.0"
     },
     {
       "name": "path",
@@ -326,6 +410,18 @@
       "languageVersion": "2.12"
     },
     {
+      "name": "share_plus",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/share_plus-7.2.2",
+      "packageUri": "lib/",
+      "languageVersion": "2.18"
+    },
+    {
+      "name": "share_plus_platform_interface",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/share_plus_platform_interface-3.4.0",
+      "packageUri": "lib/",
+      "languageVersion": "2.18"
+    },
+    {
       "name": "shelf",
       "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/shelf-1.4.2",
       "packageUri": "lib/",
@@ -386,6 +482,30 @@
       "languageVersion": "3.5"
     },
     {
+      "name": "url_launcher_linux",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/url_launcher_linux-3.2.2",
+      "packageUri": "lib/",
+      "languageVersion": "3.8"
+    },
+    {
+      "name": "url_launcher_platform_interface",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/url_launcher_platform_interface-2.3.2",
+      "packageUri": "lib/",
+      "languageVersion": "3.1"
+    },
+    {
+      "name": "url_launcher_web",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/url_launcher_web-2.4.2",
+      "packageUri": "lib/",
+      "languageVersion": "3.10"
+    },
+    {
+      "name": "url_launcher_windows",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/url_launcher_windows-3.1.5",
+      "packageUri": "lib/",
+      "languageVersion": "3.8"
+    },
+    {
       "name": "uuid",
       "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/uuid-4.5.2",
       "packageUri": "lib/",
@@ -408,6 +528,12 @@
       "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/web-1.1.1",
       "packageUri": "lib/",
       "languageVersion": "3.4"
+    },
+    {
+      "name": "win32",
+      "rootUri": "file:///home/ycwork/.pub-cache/hosted/pub.flutter-io.cn/win32-5.15.0",
+      "packageUri": "lib/",
+      "languageVersion": "3.8"
     },
     {
       "name": "xdg_directories",
