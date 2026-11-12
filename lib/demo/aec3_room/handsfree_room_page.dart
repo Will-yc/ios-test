@@ -97,14 +97,22 @@ final int kPlayGainPct = math.min(
 /// 残余更小，整个网络环路的增益就被压到 1 以下。
 ///
 /// 实现上分平台：
-///   - Android：**双流**。成品链保持裸麦 48k + 我们的 AEC3（保住 20kHz
-///     音质，这是已验收的指标）；另开一条 16k VOICE_COMMUNICATION 流，
-///     系统 3A 处理后直接编码上行。该流失败/全零 3s 自动回退旧上行。
-///   - iOS：系统不允许两条采集流，只能单流开 VPIO（echoCancel=true）。
-///     代价是采集带宽可能被系统压到语音档（TRTC 通话同样如此），
+///   - Android：**默认单流**。成品与上行共用一条裸麦 48k 流（保 20kHz 音质，
+///     已验收），上行经我们自己的 AEC3。网络环路啸叫由「投票检测 + 双侧陷波
+///     + 70% 音量」压增益来治（系统 AEC 追不上 ~1.1s 的网络环路）。
+///   - iOS：系统不允许两条采集流，单流开 VPIO（echoCancel=true）。
 ///     我们的 AEC3/门链保留作第二层。--dart-define=SYS_3A=false 可回退 A/B。
 const bool kSys3A =
     String.fromEnvironment('SYS_3A', defaultValue: 'true') == 'true';
+
+/// Android「双流」开关，**默认关**。2026-11-12 真机回归实测（PMA120）：
+/// 第二条 VOICE_COMMUNICATION 采集流一启动就把第一条裸麦成品流抢占停摆
+/// （成品.pcm 与 _raw.pcm 都只剩 80ms）→ Android 成品全空；且 modeNormal
+/// 下 AcousticEchoCanceler 不生效（它要 MODE_IN_COMMUNICATION），这条上行
+/// 反而把对端声音原样送回 → iOS 一直听到自己的回声。故默认回到单流。
+/// 仅在确认能并发采集的机型上才用 --dart-define=SYS_3A_DUAL=true 打开做 A/B。
+const bool kAndroidDualStream =
+    String.fromEnvironment('SYS_3A_DUAL', defaultValue: 'false') == 'true';
 
 /// 诊断开关：把 AEC **之前**的原始采集也落一份 `_raw.pcm`，
 /// 重测后可以拿两份文件直接算出真实 ERLE，不用再靠听感判断。
@@ -139,9 +147,10 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   StreamSubscription<Uint8List>? _micSub;
   bool _gotMicData = false;
 
-  // ---------- 系统 3A 上行流（仅 Android，见 kSys3A）----------
+  // ---------- 系统 3A 上行流（仅 Android 且 SYS_3A_DUAL=true，默认不用）----------
   // 第二条采集流：16k VOICE_COMMUNICATION + 系统 AEC/NS/AGC，直接编码上行。
-  // 成品仍走第一条裸麦 48k 流，两条流互不影响（record 插件按实例隔离）。
+  // 注意：record 插件虽按实例隔离，但系统层并发采集会抢占 —— PMA120 实测
+  // 第二条流会把第一条裸麦成品流停摆，故默认关闭，见 kAndroidDualStream。
   final AudioRecorder _uplinkRecorder = AudioRecorder();
   StreamSubscription<Uint8List>? _uplinkSub;
   OpusEncoder? _uplinkEncoder;
@@ -716,8 +725,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
         _log('🛡️ iOS 系统 3A（VPIO）已开：采集先经系统 AEC/NS/AGC');
       }
 
-      // Android：第二条上行流（系统 3A），失败自动回退 worker 上行
-      if (kSys3A && Platform.isAndroid) {
+      // Android：默认单流（成品+上行共用裸麦 48k）。双流仅在显式打开
+      // SYS_3A_DUAL 时启用 —— PMA120 上并发采集会把成品流抢占停摆，见 kAndroidDualStream。
+      if (kSys3A && Platform.isAndroid && kAndroidDualStream) {
         await _startSysUplink();
       }
 
@@ -1396,17 +1406,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
                   border: OutlineInputBorder(),
                 ),
               ),
-              const SizedBox(height: 10),
-              TextField(
-                controller: _urlCtrl,
-                enabled: _canEditConfig,
-                style: const TextStyle(fontSize: 12),
-                decoration: const InputDecoration(
-                  labelText: '服务地址',
-                  isDense: true,
-                  border: OutlineInputBorder(),
-                ),
-              ),
               const SizedBox(height: 12),
               Row(
                 children: [
@@ -1620,10 +1619,12 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
                   ? '关 · 纯 AEC3 上行'
                   : Platform.isIOS
                       ? '开 · iOS VPIO 单流'
-                      : (_sysUplinkActive
-                          ? '开 · VOICE_COMM 双流'
-                          : '回退 · worker 上行'),
-              ok: kSys3A && (Platform.isIOS || _sysUplinkActive),
+                      : (kAndroidDualStream
+                          ? (_sysUplinkActive
+                              ? '开 · VOICE_COMM 双流'
+                              : '回退 · worker 上行')
+                          : '单流 · 裸麦48k→AEC3 上行'),
+              ok: kSys3A && (Platform.isIOS || !kAndroidDualStream || _sysUplinkActive),
             ),
             _row(
               '上行 AGC',
