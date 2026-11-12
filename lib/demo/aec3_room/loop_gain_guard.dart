@@ -119,8 +119,17 @@ class LoopGainGuard {
   // ---------- 参数（全常量，便于纯 Dart 单测按同一套数值复刻）----------
   static const int fftSize = 1024; // 21.3ms @48k
   static const int hopSize = 512; // 10.7ms 一帧，50% 重叠
-  static const int lowBin = 4; // ~187Hz
-  static const int highBin = 86; // ~4.0kHz（啸叫实测 823Hz / 2.1kHz）
+  static const int lowBin = 4; // ~187Hz（Q 的邻带统计从这里起）
+  static const int highBin = 86; // ~4.0kHz
+
+  /// **峰值搜索的下限**：~1.2kHz。
+  ///
+  /// 上一版从 187Hz 起搜峰，人声基频（85~400Hz）与低次谐波正好落在里面 ——
+  /// 真机上守卫把 375Hz / 703Hz 当成啸叫，`triggerCount` 飙到 21 次，
+  /// 播放增益被反复 duck 到 25%，对讲音量忽大忽小，而实际并没有啸叫。
+  /// 实测啸叫落在 1.5~3kHz，抬到 1.2kHz 既能覆盖实测频段，又完全避开基频。
+  /// 页面侧的陷波检测读 `lastPeakHz`，这里抬高后自动同步（与 kNotchMinHz 一致）。
+  static const int peakLowBin = 26; // ~1219Hz @48k/1024
   static const double peakQDb = 18.0; // 窄带峰相对邻带的能量比
   static const double minTonality = 0.5; // 窄带能量 / 全帧能量
   static const double minPeakDbfs = -50.0; // 排除本底噪声
@@ -276,9 +285,9 @@ class LoopGainGuard {
       _power[k] = _re[k] * _re[k] + _im[k] * _im[k];
     }
 
-    int peakBin = lowBin;
+    int peakBin = peakLowBin;
     double peak = 0;
-    for (int k = lowBin; k <= highBin; k++) {
+    for (int k = peakLowBin; k <= highBin; k++) {
       if (_power[k] > peak) {
         peak = _power[k];
         peakBin = k;
@@ -288,10 +297,11 @@ class LoopGainGuard {
     final double peakDbfs =
         20 * _log10(4.0 * math.sqrt(peak) / fftSize + 1e-20);
 
-    // 邻带（跳过峰附近 ±2 bin），只统计 187Hz~4kHz
+    // 邻带（跳过峰附近 ±2 bin），与峰搜索同区间（1.2~4kHz）。
+    // 若把低频也算进邻带，人声基频的大能量会把 Q 稀释掉，真啸叫反而漏判。
     double nbSum = 0;
     int nbCount = 0;
-    for (int k = lowBin; k <= highBin; k++) {
+    for (int k = peakLowBin; k <= highBin; k++) {
       if ((k - peakBin).abs() <= 2) continue;
       nbSum += _power[k];
       nbCount++;

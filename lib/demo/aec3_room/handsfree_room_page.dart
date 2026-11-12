@@ -145,8 +145,17 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   bool _residualGate = false;
   // 采集侧啸叫陷波是否在岗（worker 回报）
   bool _howlNotch = false;
+  // 采集侧底噪门是否在岗
+  bool _noiseGate = false;
   // 上行 AGC 是否在岗（默认关：它会把啸叫托在稳态）
   bool _upstreamAgc = false;
+  // worker 是否已完成初始化（未初始化时下面几行显示的是初始值，
+  // 直接写「关」会让人误以为被编译期关掉了 —— 真机问过一次）
+  bool _audioInited = false;
+  // 相关门自搜出来的回声延迟与当帧读数（诊断：lag 不合理就说明这层没工作）
+  int _gateLagMs = -1;
+  double _gateRho = 0;
+  double _noiseFloorDb = -90;
   // 当前真正在挖的陷波频点
   List<double> _notchHz = const <double>[];
   // 检测器下发给 worker 的频点集合（去重、带淘汰）
@@ -349,7 +358,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
             _highBandBypass = message['highBandBypass'] == true;
             _residualGate = message['residualGate'] == true;
             _howlNotch = message['howlNotch'] == true;
+            _noiseGate = message['noiseGate'] == true;
             _upstreamAgc = message['upstreamAgc'] == true;
+            _audioInited = true;
           });
           break;
         case 'howl_notch_ack':
@@ -368,6 +379,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
             _aecStarved = (message['starved'] as num?)?.toInt() ?? 0;
             _aecBytesIn = (message['bytesIn'] as num?)?.toInt() ?? 0;
             _aecBytesOut = (message['bytesOut'] as num?)?.toInt() ?? 0;
+            _gateLagMs = (message['gateLagMs'] as num?)?.toInt() ?? -1;
+            _gateRho = (message['gateRho'] as num?)?.toDouble() ?? 0;
+            _noiseFloorDb = (message['noiseFloor'] as num?)?.toDouble() ?? -90;
           });
           break;
         case 'file-closed':
@@ -567,6 +581,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       _inDbfs = -90;
       _outDbfs = -90;
       _aecFrames = 0;
+      _audioInited = false;
       _aecStarved = 0;
       _aecBytesIn = 0;
       _aecBytesOut = 0;
@@ -1382,22 +1397,41 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
             ),
             _row(
               '高频旁路',
-              _highBandBypass ? '开 · 成品可达 20kHz' : '关 · 旧行为',
-              ok: _highBandBypass,
+              !_audioInited
+                  ? '— 待开录'
+                  : (_highBandBypass ? '开 · 成品可达 20kHz' : '关 · 旧行为'),
+              ok: _audioInited && _highBandBypass,
             ),
             _row(
               '残留门',
-              _residualGate ? '开 · 成品彻底无回声' : '关 · 仅 AEC3',
-              ok: _residualGate,
+              !_audioInited
+                  ? '— 待开录'
+                  : !_residualGate
+                  ? '关 · 仅 AEC3'
+                  : (_gateLagMs < 0
+                      ? '开 · 正在搜回声延迟'
+                      : '开 · 对齐 $_gateLagMs ms（ρ=${_gateRho.toStringAsFixed(2)}）'),
+              ok: _audioInited && _residualGate && _gateLagMs >= 0,
             ),
             _row(
               '啸叫陷波',
-              !_howlNotch
+              !_audioInited
+                  ? '— 待开录'
+                  : !_howlNotch
                   ? '关'
                   : (_notchHz.isEmpty
                       ? '待命 · 未检出'
                       : '挖 ${_notchHz.map((e) => e.toStringAsFixed(0)).join('/')}Hz'),
-              ok: _howlNotch,
+              ok: _audioInited && _howlNotch,
+            ),
+            _row(
+              '底噪门',
+              !_audioInited
+                  ? '— 待开录'
+                  : (_noiseGate
+                      ? '开 · 噪底 ${_noiseFloorDb.toStringAsFixed(0)}dBFS'
+                      : '关'),
+              ok: _audioInited && _noiseGate,
             ),
             _row(
               '上行 AGC',

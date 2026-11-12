@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:my_flutter_app/demo/util/my_dual_resampler_rate.dart';
 import 'package:native_aec/native_aec.dart';
 import 'package:my_flutter_app/demo/aec3_room/howl_notch.dart';
+import 'package:my_flutter_app/demo/aec3_room/noise_gate.dart';
 import 'package:my_flutter_app/demo/aec3_room/residual_gate.dart';
 import 'package:opus_ffi/opus_ffi.dart';
 
@@ -37,6 +38,15 @@ const bool kHighBandBypass =
 /// 用 `--dart-define=RESIDUAL_GATE=false` 可退回纯 AEC3 行为做对照。
 const bool kResidualGate =
     String.fromEnvironment('RESIDUAL_GATE', defaultValue: 'true') == 'true';
+
+/// 采集侧底噪门开关。默认开。
+///
+/// AEC3 的 NS 被有意关掉（怕改频响），所以**静音期的底噪原样进成品**：
+/// 真机安静段里 120~130Hz 窄带嗡鸣占能量 ~36%、12~18kHz 有嘶声、iOS 整体
+/// 底噪 −57dBFS。这一层只压「明显不像语音」的帧，语音帧立刻全开。
+/// 用 `--dart-define=NOISE_GATE=false` 退回旧行为做 A/B。
+const bool kNoiseGate =
+    String.fromEnvironment('NOISE_GATE', defaultValue: 'true') == 'true';
 
 /// 采集侧啸叫陷波开关。默认开。
 ///
@@ -119,6 +129,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
     // 不碰上行 opus。开关 FULLBAND/RESIDUAL_GATE 控制。
     ResidualGate? gate;
 
+    // 采集侧底噪门（AEC + 陷波 + 相关门之后）。上行与成品同时生效。
+    final NoiseGate? noiseGate =
+        kNoiseGate ? NoiseGate(sampleRate: kSampleRateRecorder) : null;
+
     await for (final message in workerReceivePort) {
       if (message is! Map) continue;
       final String type = message['type'];
@@ -165,8 +179,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
             if (kResidualGate) {
               gate ??= ResidualGate(
                 sampleRate: kSampleRateRecorder,
-                // 参考信号已由页面侧 REF_DELAY 队列对齐，这里不再平移
-                refDelayMs: 0,
+                // 页面侧 REF_DELAY 只是给 AEC3 用的「较小延迟」，
+                // 与本门要对齐的真实回声延迟（播放缓冲 + 声学，实测 321~352ms）
+                // 不是一回事 —— 这里让门自己搜，assumedDelayMs 只当初始值。
+                assumedDelayMs: 300,
               );
             } else {
               gate = null;
@@ -174,6 +190,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
             gate?.reset();
             // 陷波器跨分段保留会带着上一段的振荡状态，这里一并清掉
             notch?.reset();
+            noiseGate?.reset();
 
             final String? filePath = message['filePath'];
             if (filePath != null && filePath.isNotEmpty) {
@@ -195,6 +212,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
               'highBandBypass': aec?.highBandBypassEnabled ?? false,
               'residualGate': gate != null,
               'howlNotch': notch != null,
+              'noiseGate': noiseGate != null,
               'upstreamAgc': upstreamAgc != null,
             });
             break;
@@ -247,19 +265,28 @@ void audioProcessingWorker(SendPort mainSendPort) {
               chunk = notch.process(chunk);
             }
 
-            // 下行相关门：把 AEC 漏掉的残余回声「整帧压低」。只影响落盘成品。
-            if (gate != null && chunk.isNotEmpty) {
-              chunk = gate.process(chunk, refAligned: true);
-            }
+            // 底噪门：只压「明显不像语音」的帧（静音期嗡鸣 / 高频嘶声）。
+            // 放在相关门**之前**取一份给上行用，但**不改动 chunk 本身** ——
+            // 相关门的判决必须基于未被压过的真实能量，否则弱语音会被
+            // 「能量远低于参考」这条兜底判成残余，整句被砍掉。
+            final Uint8List upChunk = (noiseGate != null && chunk.isNotEmpty)
+                ? noiseGate.process(chunk)
+                : chunk;
+
+            // 下行相关门：给落盘成品用的那一份（上行不经过它 ——
+            // 对讲时把对方声音整段压掉会让对讲变成半双工，成品干净就够了）。
+            final Uint8List outChunk = (gate != null && chunk.isNotEmpty)
+                ? gate.process(chunk)
+                : chunk;
 
             // =================== 1. 文件写入（成品：AEC 后的 48k pcm）===================
-            if (isWriteRecordFile && fileSink != null && chunk.isNotEmpty) {
-              ioBuffer.add(chunk);
+            if (isWriteRecordFile && fileSink != null && outChunk.isNotEmpty) {
+              ioBuffer.add(outChunk);
               if (isFirstChunk) {
                 fileSink.add(ioBuffer.takeBytes());
                 await fileSink.flush();
                 final int chunkDurationMs =
-                    (chunk.length ~/ 2) * 1000 ~/ kSampleRateRecorder;
+                    (outChunk.length ~/ 2) * 1000 ~/ kSampleRateRecorder;
                 // captureTime ≈ 这段音频结束时刻，减掉时长得到起点
                 mainSendPort.send({
                   'type': 'first_chunk_time',
@@ -278,7 +305,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
 
             // =================== 2. 上行 Opus 编码 ===================
             if (encoder != null && chunk.isNotEmpty) {
-              Uint8List resampled = MyResamplerRate.resample48kTo16k(chunk);
+              Uint8List resampled = MyResamplerRate.resample48kTo16k(upChunk);
               if (upstreamAgc != null) {
                 resampled = upstreamAgc.process(resampled);
               }
@@ -303,6 +330,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
             // 延迟标定结束后重置 AEC（标定那 3s 故意不喂参考，滤波器状态已失效）。
             // 只重置算法句柄，绝不动 fileSink / encoder，否则成品会断流。
             aec?.reset();
+            // 标定期间参考与采集都不连续，两个门的历史同样作废：
+            // 留着旧的 lag / 噪底只会在标定后头几百毫秒做错判决。
+            gate?.reset();
+            noiseGate?.reset();
             break;
 
           case 'howl_notch':
@@ -348,6 +379,13 @@ void audioProcessingWorker(SendPort mainSendPort) {
               'starved': st?.refStarvedFrames ?? 0,
               'bytesIn': bytesIn,
               'bytesOut': bytesOut,
+              // 相关门的对齐状态：真机上「lag 是不是一个合理值」直接决定
+              // 这层门有没有在工作 —— 之前它永远算不出 lag，所以从没生效过。
+              'gateLagMs': gate?.currentLagMs ?? -1,
+              'gateRho': gate?.lastRho,
+              'gateGain': gate?.currentGain,
+              'noiseFloor': noiseGate?.floorDbfs,
+              'noiseGain': noiseGate?.gain,
             });
             break;
 
