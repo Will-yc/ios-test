@@ -1,0 +1,98 @@
+name: AEC3 build check
+
+# 只验证「能不能编过、符号有没有真的链进去」，不签名、不出包。
+# 双平台各跑一遍：Android 用 NDK 编 .so，iOS 用 Xcode 编静态库 + 桥接。
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'lib/**'
+      - 'packages/native_aec/**'
+      - 'pubspec.yaml'
+      - 'ios/**'
+      - 'android/**'
+      - '.github/workflows/aec3-build-check.yml'
+
+jobs:
+  android:
+    name: Android (arm64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.5'
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: Build APK (debug, arm64)
+        run: flutter build apk --debug --target-platform android-arm64
+
+      - name: Assert native libs are packaged
+        run: |
+          set -e
+          APK=build/app/outputs/flutter-apk/app-debug.apk
+          unzip -l "$APK" | grep -E "libnative_aec\.so" || { echo "❌ libnative_aec.so 没进 APK"; exit 1; }
+          unzip -l "$APK" | grep -E "libwebrtc-audio-processing-3\.so" || { echo "❌ webrtc 库没进 APK"; exit 1; }
+          echo "✅ 两个 so 都在 APK 里"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: aec3-android-debug-apk
+          path: build/app/outputs/flutter-apk/app-debug.apk
+          retention-days: 7
+
+  ios:
+    name: iOS (no codesign)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.5'
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      - name: pod install
+        run: |
+          cd ios
+          pod install
+
+      - name: Build iOS (no codesign)
+        run: flutter build ios --debug --no-codesign
+
+      - name: Assert AEC3 symbols linked into binary
+        run: |
+          set -e
+          APP=build/ios/iphoneos/Runner.app/Runner
+          ls -lh "$APP"
+          echo "--- aec3 符号 ---"
+          nm -gU "$APP" | grep -E "aec3_(create|process_capture|push_reference|build_info)" || {
+            echo "❌ AEC3 符号没有链进 Runner 二进制（xcframework 或桥接没编进去）"
+            exit 1
+          }
+          echo "✅ AEC3 已静态链入 Runner"
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-logs
+          path: |
+            ios/Pods/Target Support Files/**/*.xcconfig
+            build/ios/**/*.log
+          retention-days: 3

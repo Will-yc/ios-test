@@ -1,0 +1,60 @@
+// The Android Gradle Plugin builds the native code with the Android NDK.
+
+group = "com.example.native_aec"
+version = "1.0"
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath("com.android.tools.build:gradle:8.11.1")
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: "com.android.library"
+
+android {
+    namespace = "com.example.native_aec"
+
+    compileSdk = 36
+
+    // Use the NDK version declared in the Flutter project.
+    ndkVersion = android.ndkVersion
+
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            // 不需要显式传 ANDROID_STL：AGP 默认就是 c++_static，
+            // 与预编译库（已静态链入 libc++）一致。
+            // 两边只通过 C 接口交换 POD 指针，不跨库传 C++ 对象，互不干扰。
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        // 预编译库的 ABI 下限是 API 24
+        minSdk = 24
+
+        // 只能限定在「预编译库真实存在的 ABI」上。
+        // library 模块的 externalNativeBuild 会为 defaultConfig 里的**所有** ABI
+        // 各跑一遍 CMake，app 侧设 abiFilters 并不能阻止它 —— 少了这条，
+        // 构建会在没有 .so 的 x86 上直接失败。
+        ndk {
+            abiFilters.addAll(["arm64-v8a", "armeabi-v7a", "x86_64"])
+        }
+    }
+}

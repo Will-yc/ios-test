@@ -56,3 +56,10 @@ rebel.xml
 application-my.yaml
 
 /yudao-ui-app/unpackage/
+
+# app 自己 CMake 的输出目录（native_add 演示库），不是源码
+/android/app/src/main/jniLibs/
+
+# native_aec 插件的 CMake/Gradle 缓存
+/packages/native_aec/android/.cxx/
+/packages/native_aec/android/build/

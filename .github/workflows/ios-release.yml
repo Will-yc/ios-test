@@ -1,13 +1,9 @@
 name: Build Flutter iOS IPA
 
 on:
+  # 只保留手动触发：这条流水线需要签名证书 secrets，
+  # 日常提交交给我们新加的 aec3-build-check.yml（免签名，只验证编译）。
   workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - 'lib/**'
-      - 'ios/**'
-      - 'pubspec.yaml'
 
 jobs:
   build-ios-ipa:

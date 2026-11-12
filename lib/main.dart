@@ -2,6 +2,7 @@ import 'dart:ffi';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:my_flutter_app/demo/aec3_test_page.dart';
 import 'package:my_flutter_app/demo/test_opus.dart';
 
 import 'package:ffi/ffi.dart';
@@ -101,6 +102,37 @@ class NavigationPage extends StatelessWidget {
                     SizedBox(width: 10),
                     Text(
                       '测试ffi',
+                      style: TextStyle(fontSize: 18, color: Colors.white),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 40, vertical: 10),
+              child: ElevatedButton(
+                onPressed: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => const Aec3TestPage(),
+                    ),
+                  );
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.deepOrangeAccent,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+                child: const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.graphic_eq, color: Colors.white),
+                    SizedBox(width: 10),
+                    Text(
+                      'AEC3 回声消除自测',
                       style: TextStyle(fontSize: 18, color: Colors.white),
                     ),
                   ],

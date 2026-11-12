@@ -29,6 +29,13 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // 必须与 packages/native_aec 提供的预编译库 ABI 严格一致。
+        // 预编译包只有 arm64-v8a / armeabi-v7a / x86_64（没有 x86），
+        // 少了这条，Gradle 会为 x86 也跑一遍 CMake 从而直接失败。
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
+        }
     }
 
     buildTypes {

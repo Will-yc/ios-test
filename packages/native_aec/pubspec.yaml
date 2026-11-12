@@ -1,0 +1,27 @@
+name: native_aec
+description: "WebRTC AEC3 (acoustic echo cancellation) FFI plugin for hands-free recording."
+version: 0.0.1
+publish_to: 'none'
+
+environment:
+  sdk: ^3.10.4
+  flutter: '>=3.3.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  # 运行时要用 calloc / Pointer，不能只放 dev_dependencies
+  ffi: ^2.1.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  plugin:
+    platforms:
+      android:
+        ffiPlugin: true
+      ios:
+        ffiPlugin: true
