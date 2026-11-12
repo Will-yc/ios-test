@@ -48,17 +48,20 @@ const String kDefaultRoomId = String.fromEnvironment(
 /// 参考信号延迟补偿（ms）——**这是外放回声能不能消掉的关键，不是调参**。
 ///
 /// AEC 只能消「参考帧 ↔ 采集帧按时间对齐」的那部分回声。播放侧的字节是先
-/// 交给 FlutterPcmSound，再经过 native 缓冲（targetNativeMs=100）、
-/// AudioTrack 缓冲、扬声器、空气、麦克风，真机实测要 **321~352ms** 之后才会
-/// 出现在采集流里。补偿 0 时 AEC 看到的是「参考比回声早 350ms」，线性滤波器
-/// 与延迟估计器都对不上，于是整段回声原样留在成品里 —— 听感就是「文件里有
-/// 对方的声音」。
+/// 交给播放引擎，再经过 native 缓冲（targetNativeMs=100）、输出缓冲、扬声器、
+/// 空气、麦克风，之后才会出现在采集流里。**这段延迟两端不一样**：
+///   - Android（PMA120 实测）：AudioTrack 缓冲大，321~352ms → 补 250
+///   - iOS：AudioUnit 输出缓冲小得多，估 130~160ms → 补 100（未实测，
+///     先保守取小；可用 REF_DELAY_MS 覆盖后重测）
 ///
-/// 推 250ms 后表观延迟剩 ~100ms（正延迟，AEC3 自己的延迟估计器能吃掉），
-/// e2e 自测页实测 ERLE 24.6dB。**不能推满 352**：估偏一点就变成负延迟，
-/// AEC 无法处理，效果会突然崩到 0。要用别的值就
-/// `--dart-define=REF_DELAY_MS=300`（宁可偏小，别偏大）。
-const int kRefDelayMs = int.fromEnvironment('REF_DELAY_MS', defaultValue: 250);
+/// 推得过满会变成**负延迟**（参考比回声晚到），AEC 无法处理、效果直接归零
+/// —— 两端闭环里只要有一端归零，回声残余 ~0dB，再叠上 iOS 上行 AGC（最高
+/// +24dB），环路增益就会过 1，表现为**双方一停顿就啸叫**。所以宁可欠补
+/// （留正延迟，AEC 自己的延迟估计器能吃），别过补。
+final int kRefDelayMs = int.fromEnvironment(
+  'REF_DELAY_MS',
+  defaultValue: Platform.isAndroid ? 250 : 100,
+);
 
 /// 播放增益（百分比）。默认 100 = 不放大。
 ///

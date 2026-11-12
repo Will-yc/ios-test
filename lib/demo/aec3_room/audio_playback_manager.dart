@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
@@ -36,6 +37,9 @@ class AudioPlaybackManager {
 
   bool _isRunning = false;
   bool _isInitialized = false;
+
+  /// 啸叫兜底：闭环自激一旦起振，靠人去关音量已经来不及。
+  final _HowlingGuard _howling = _HowlingGuard();
 
   final BytesBuilder _playbackBuffer = BytesBuilder();
 
@@ -113,6 +117,7 @@ class AudioPlaybackManager {
 
     try {
       final Int16List decodedPcm = _decoder.decode(opusPacket);
+      _howling.feed(decodedPcm);
       _playbackBuffer.add(Uint8List.view(
         decodedPcm.buffer,
         decodedPcm.offsetInBytes,
@@ -168,9 +173,11 @@ class AudioPlaybackManager {
       chunk.length ~/ 2,
     );
     final ByteData out = ByteData(chunk.length);
+    // duck = 啸叫兜底的临时压低系数（检测不到啸叫时恒为 1.0）
+    final double duck = _howling.duckFactor;
 
     for (int i = 0; i < pcm.length; i++) {
-      double vol = baseVolume;
+      double vol = baseVolume * duck;
       if (_fadeInSamplesRemaining > 0) {
         final double factor =
             1.0 - (_fadeInSamplesRemaining / _msToFrames(fadeInDurationMs));
@@ -219,5 +226,90 @@ class AudioPlaybackManager {
       debugPrint('音频引擎操作失败: $e');
     });
     return propagateError ? run : _audioOpChain;
+  }
+}
+
+/// 啸叫（闭环自激）兜底。
+///
+/// 无耳机双端外放时，A 麦 → 上行 → B 扬声器 → B 麦 → 上行 → A 扬声器
+/// 是一个闭环；只要有一端 AEC 没对齐（残余回声没消掉），环路增益就可能过 1，
+/// 在某个频点起振——表现为双方都不说话时突然尖啸，靠人去关音量根本来不及。
+///
+/// 检测特征（纯时域，零依赖）：啸叫是**等幅单频正弦**，
+/// 它的「每帧过零率」几乎恒定；语音的过零率帧间波动很大。
+/// 连续 800ms 过零率变异系数 < 2% 且每帧都够响 → 判定啸叫，
+/// 立即把播放增益压到 0.3（打断环路），3 秒内线性恢复。
+///
+/// 误伤分析：正常语音不可能 800ms 过零率恒定；稳态窄带噪声（风扇）能量
+/// 远低于 -40dBFS 门限。duck 期间参考信号同步缩小（取自同一份 out 字节），
+/// AEC 只需跟着慢变增益收敛，不会错位。
+class _HowlingGuard {
+  static const int windowFrames = 40; // 40 × 20ms = 800ms
+  static const double minRms = 0.01; // -40dBFS，排除本底噪声
+  static const double zcrCvLimit = 0.02; // 过零率变异系数门限
+  static const double minZcr = 0.005; // 过零率太低（近直流/极低频）不判
+  static const double duckLevel = 0.3;
+  static const int holdFrames = 150; // 压低保持 3s 后线性恢复
+
+  final List<double> _zcrs = <double>[];
+  final List<double> _rmss = <double>[];
+  int _duckFramesLeft = 0;
+  bool _logged = false;
+
+  double _duck = 1.0;
+  double get duckFactor => _duck;
+
+  void feed(Int16List frame) {
+    final int n = frame.length;
+    if (n < 64) return;
+
+    int crossings = 0;
+    double sumSq = 0.0;
+    for (int i = 1; i < n; i++) {
+      final int a = frame[i - 1];
+      final int b = frame[i];
+      if ((a >= 0) != (b >= 0)) crossings++;
+      final double v = b / 32768.0;
+      sumSq += v * v;
+    }
+    _zcrs.add(crossings / n);
+    _rmss.add(math.sqrt(sumSq / n));
+    if (_zcrs.length > windowFrames) {
+      _zcrs.removeAt(0);
+      _rmss.removeAt(0);
+    }
+
+    // duck 状态推进（线性恢复，让 AEC 能跟着收敛）
+    if (_duckFramesLeft > 0) {
+      _duckFramesLeft--;
+      final double t = 1.0 - _duckFramesLeft / holdFrames;
+      _duck = duckLevel + (1.0 - duckLevel) * t;
+      if (_duckFramesLeft == 0) _logged = false;
+    } else {
+      _duck = 1.0;
+    }
+
+    // 检测（只在未 duck 时判，避免恢复期反复触发）
+    if (_duckFramesLeft > 0 || _zcrs.length < windowFrames) return;
+    for (final r in _rmss) {
+      if (r < minRms) return;
+    }
+    final double mean = _zcrs.reduce((a, b) => a + b) / windowFrames;
+    if (mean < minZcr) return;
+    double varSum = 0.0;
+    for (final z in _zcrs) {
+      final double d = z - mean;
+      varSum += d * d;
+    }
+    final double cv = math.sqrt(varSum / windowFrames) / mean;
+    if (cv < zcrCvLimit) {
+      _duckFramesLeft = holdFrames;
+      _duck = duckLevel;
+      if (!_logged) {
+        _logged = true;
+        debugPrint('🔥 检测到啸叫（过零率恒定 ${mean.toStringAsFixed(3)}，'
+            'CV=${cv.toStringAsFixed(4)}），压低播放增益 3 秒');
+      }
+    }
   }
 }
