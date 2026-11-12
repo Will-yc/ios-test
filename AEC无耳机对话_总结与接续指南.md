@@ -408,3 +408,336 @@ iOS 仍能明确听到自己的回声；Android 成品录到两个人的声音�
 3. iOS 不再听到自己的回声（Android 上行已过门）；双讲时上行会被压，属预期。
 4. 服务端单向延迟 2~3.6s 明显异常（TRTC 同级场景 <400ms），建议查
    appapi.zhiyuexc.com/audiowss 的混音/转发缓冲——这不修，对话体验始终差。
+
+## 十六、TRTC 闭源包解剖 + 成熟厂商方案对比 → 稳定版设计（2026-11-12 晚）
+
+### TRTC 闭源包能不能看？——能，部分能
+iOS 的 `TXLiteAVSDK_Professional.xcframework` 不在本地（podspec 远程拉），
+但 **Android AAR 在 gradle 缓存里**：`LiteAVSDK_Professional-13.6.0.20747.aar`
+→ `/tmp/liteav/jni/arm64-v8a/libliteavsdk.so`（15MB）。对它做 `strings`
+拿到了 TRTC 内部 3A 的**架构级事实**（不是猜的，全是它自己的日志/符号/云控 key）：
+
+**TRTC 的回声链路（从二进制里读出来的）：**
+1. **两级 AEC**：AI-AEC（`aiec/` 目录，多个模型：60m/80m/95m/105m/140m，
+   MDF/SMDF/AMDF 多种自适应滤波结构）为主，**推理失败自动降级到经典 AEC**
+   （`AiEcDownGradeToClassicAec` / `"aiec down grade to classic aec"` /
+   `"downgrade to classic 3a … inference error count"`）。经典核就是
+   **WebRTC AECM**（`aecmaec_aecmcore.c` / `Aecm_aec.c` / `iAecm_clean_farend`）。
+   → 和我们一样：AEC3(线性) + 一层非线性残余抑制，只是它上层用 NN。
+2. **NLP 残余抑制分级可调**：`aec_nlp_level`（云控 `force_nlp_level`），
+   这就是它的"残留门"——对应我们的 correlation gate。
+3. **延迟估计/补偿是独立开关**：`aec delay estimate switch` /
+   `aec delay compensate switch` / `TapAecAnsCore_SetDelayChangedState` /
+   `TapAecAnsCore_SetDelayJitterState` / `update echo delay` /
+   `AEC_filter_reset1:last_delay=%d,delay=%d`。→ 印证：**参考↔采集延迟对齐
+   是 AEC 成败的第一要素**，TRTC 专门有延迟抖动状态机。我们靠
+   `_forwardReference`(ref 延迟 `_refDelayMs`) + 门的 lag 搜索做同一件事。
+4. **收敛期静音**：`convergence_mute_enable` / `aec_beginning_mute_time_ms` /
+   `aec_beginning_mute_config`。→ AEC 没收敛前先静音，避免漏回声。
+   **这一条我们还没做**（见稳定版）。
+5. **参考饥饿处理**：`"aec data feed playout lack"` / recover、`EchoBus`、
+   `AecStereoReferencePcmStrategy`。→ 渲染流断供时专门处理，对应我们
+   `_aecStarved`（缺参考计数）。
+6. **独立啸叫处理器**：`AudioHowlingProcessor`（`kHowlingProcess`）、
+   NN 模型 `grulite_howling_16k.bin` / `trae_howling_grulite16k`、
+   `enableHowlingDetect` / `enableHowlingSuppression` /
+   `"mic howling happened!! sr:%f,delay:%f"`、告警码 7002
+   `WARNING_MICROPHONE_HOWLING_DETECTED`。→ 啸叫是**独立一级**，用 GRU 网络。
+   我们用 `HowlNotch`(陷波) + `LoopGainGuard`(环路增益 duck)，是它的轻量版。
+7. **回声状态检测灵敏度可调**：`echo_state_detect_sensitivity=60`。
+8. **AI 降噪也是分级 + 降级**：`AINS`(`ains_dccrn`/`ains_percepnet`)、
+   `force_ans_level`、`enable_ains_weak_suppress`、`adaptive_ans_mode`、
+   `ans_version`。→ 对应我们的底噪门，但它是 NN 且分强弱档。
+9. **AGC**：`ebur128`（广播响度标准）+ `force_agc_level`。**我们没做 AGC**。
+
+**TRTC 原生头文件补充事实**（`TRTC_Flutter-master/windows/include/TRTC/*.h`）：
+- `ITXDeviceManager.h`：**通话音量**类型有系统 AEC；**媒体音量**类型用不了系统 AEC。
+- `ITRTCCloud.h:1124`：开**自定义采集**可能关掉 SDK 的 AEC（时序控制要求）。
+- `TRTCCloudCallback.h:977+`：`onCapturedAudioFrame` 交付的是**已过 3A(ANS/AEC/AGC)** 的 PCM。
+- 音质档：Speech 18k / Default 50k / Music 128kbps 全频带立体声。
+
+### 成熟厂商的共识（Agora / AliRTC / anyRTC / 网易云信，公开资料）
+- **iOS**：因苹果软硬件高度定制，**系统 VPIO 的 AEC 效果有保证**，首选硬件 AEC
+  （VOICE_COMMUNICATION / voiceChat）；**Android 碎片化**，系统 AEC 参差甚至没有，
+  **必须加应用级软件 AEC 兜底**（zego 技术分享原话）。
+  → ⚠️ 这正是我们 iOS 的两难：VPIO 效果好，但**它参考不到 FlutterPcmSound
+  那条独立 AudioUnit 渲染流**（我们不走系统通话播放路由），所以 VPIO 的 AEC
+  拿不到参考 = 白开，还毁了音质（限带 + 数字零底噪）。TRTC 不会有这问题，
+  因为它**自己拥有整条播放路由**（`SpeakerphonePlayoutTrack`），渲染字节和
+  AEC 参考天然同源。
+- **完整 AEC 四件套**（anyRTC/阿里云）：时延估计(TDE) → 线性 AEC(NLMS/频域)
+  → 双讲检测(DTD) → **非线性残余抑制(RAES/NLP)**。我们的链 = AEC3(TDE+线性)
+  + correlation gate(RAES)，DTD 隐含在门的 rho 判决里。
+- **NN 残余抑制是趋势**：DFSMN / GCCRN / ICCRN 后滤波器级联在线性 AEC 之后
+  （知乎 Multi-task Deep RES；TRTC 的 `aiec_*` 就是这类）。**这是我们能借鉴的
+  下一代方向，但需要模型 + 训练数据，本轮不做。**
+
+### 对比结论：我们现在的链 vs TRTC/成熟方案
+| 环节 | TRTC | Agora/Ali | 我们现状 | 差距 |
+|---|---|---|---|---|
+| 线性 AEC | AI-AEC(MDF/SMDF)+AECM 降级 | WebRTC AEC/AECM | **WebRTC AEC3** | 同级（AEC3 就是经典核） |
+| 残余抑制 NLP | aec_nlp_level 分级 | RAES | **correlation gate** | 同级（我们是相关性门，它是能量/NLP 门） |
+| 延迟对齐 | delay estimate/compensate 状态机 | TDE | **ref 延迟 + 门 lag 两遍搜索** | 同级 |
+| 参考饥饿 | playout lack/recover + EchoBus | — | **_aecStarved 计数** | 同级 |
+| 啸叫 | 独立 AudioHowlingProcessor(GRU NN) | — | **HowlNotch + LoopGainGuard** | 我们轻量版（无 NN） |
+| 降噪 | AINS(dccrn/percepnet) 分级 | AI 降噪 | **底噪门(noiseGate)** | 我们简单门限（无 NN） |
+| **收敛期静音** | **convergence_mute / beginning_mute** | — | **❌ 没有** | **建议补** |
+| **AGC** | **ebur128 + force_agc_level** | 有 | **❌ 没有** | 可选补 |
+| iOS 硬件 AEC | 拥有播放路由，VPIO 参考同源 | 首选 VPIO | **VPIO 参考不到我们的渲染流 → 关闭** | **架构差异，非 bug** |
+
+**一句话**：我们的软件链在"线性 AEC + 残余抑制 + 延迟对齐 + 啸叫 + 参考饥饿"
+上和 TRTC **同构、同级**，差的是 (a) NN 化的残余抑制/降噪/啸叫（需模型，本轮不做）、
+(b) **收敛期静音**（易补，收益大）、(c) AGC（可选）。iOS 音质问题的根不是算法弱，
+而是**播放不走系统通话路由 → VPIO 拿不到参考**，这是架构取舍，TRTC 靠自有播放路由规避。
+
+### 稳定版设计（建议落地顺序）
+**Tier 0（本轮已做，待真机验收）**：kSys3A 默认关（iOS 裸麦 48k 全频带）
++ 门阈值按实测重调 + 两遍 lag 搜索 + **门接上行**（断网络自回声环路）。
+
+**Tier 1（低风险、马上可补，直接抄 TRTC）**：
+1. **收敛期静音**：进房后 AEC3 未收敛的前 `N ms`（TRTC 用
+   `aec_beginning_mute_time_ms`，经验 300~500ms）上行直接静音或强压，
+   避免冷启动漏回声。我们的门已有 `_aecStarved`/冷启动计数，接一个
+   `_converged` 标志即可（AEC3 首次成功对齐 lag → 置位）。
+2. **参考饥饿显式化**：`_aecStarved` 超阈值时，上行按能量兜底压低
+   （TRTC 的 playout lack/recover 语义），别让 AEC 拿不到参考时裸传。
+
+> **✅ Tier 1 已实现（2026-11-12 晚）**：
+> - `residual_gate.dart`：新增收敛期静音。`convergeMuteMs=3000`（兜底上限）、
+>   `convergeSettleFrames=20`（锁定后再稳 200ms 解除）。状态机：`_lag` 首次
+>   锁定 → 记 `_lockFrame` → 稳 200ms → `_converged=true`；一直锁不上则到
+>   3000ms 无条件解除（防全程哑掉）。**只在「下行在响」时压死整帧到 gFloor**
+>   （`refRms>=1` 分支），下行静默仍走硬直通，绝不误压本端说话。
+> - 参考饥饿：门的 `refRms<1 → g=1` 硬直通**已经覆盖**——参考断供/静默时
+>   本就没有新回声（房间衰减 ~50-100ms），直通是安全的，无需额外代码。
+> - `audio_processing_worker.dart`：`aec_stats` 增 `gateConverged` 上报。
+> - `handsfree_room_page.dart`：残留门状态卡显示「收敛期静音中（压死冷启动
+>   回声）」/「已对齐 xx ms，稳定中…」/「对齐 xx ms（ρ=…）」，`ok` 要求已收敛。
+> - 离线仿真（`/tmp/a_raw.pcm` × iOS 18:27 成品，lag=3027/lead=2877）：
+>   稳态压制 **25.9dB / 11.2dB 不变**、纯本端 **0.0dB**、混合 4.0dB —— 无回归；
+>   lag 轨迹前 ~5s 仍在 `-1/17/766/1039…` 乱跳，收敛期静音正好把这段冷启动
+>   漏声压死（旧行为这里会漏回声）。`dart analyze` 三文件 0 issue。
+
+> **✅ 双讲保护（VAD + NLP 分级软压）也已实现（2026-11-12 晚，对标 TRTC
+> `nearend unmute` / `aivad` / `aec_nlp_level`）**：
+> - `residual_gate.dart`：新增轻量近端 VAD（不引 NN）。判据 = 采集电平高出
+>   自适应噪底 `vadVoiceMarginDb=10dB` **且** `rho < vadRhoMax=0.15` **且** 非纯残余。
+>   命中（双讲）→ 过渡区改软底 `midFloorVoice=0.5`(-6dB) 保留本端；纯回声帧
+>   维持硬底 0.10 / 能量兜底 gFloor。开关 `doubleTalkGuard`（worker
+>   `--dart-define=RESIDUAL_GATE_DTLK=false` 可关做 A/B）。
+> - **关键调参教训**：单靠电平 VAD 分不清「响回声」与「响本端」——AEC3 消不净
+>   的残余本身就很响，电平判据把 7% 纯回声帧误判成双讲，最强回声段从 25.9 掉到
+>   24.1dB。叠加 **rho 上限 0.15**（双讲时本端稀释相关、rho 偏低 p50≈0.12；
+>   纯回声 rho 偏高 p50≈0.36）后，纯回声误命中降到 1%、压制恢复 25.8dB。
+>   这是 TRTC 与我们差距的体现：TRTC 的 AI-AEC 把回声消得差不多，残余≈本端，
+>   电平 VAD 才够用；我们 AEC3 残余重，必须靠相关性兜底。
+> - 离线 A/B（`/tmp/a_raw.pcm` × iOS 18:27 成品）：
+>   | 段 | 关双讲保护 | 开（rho上限0.15）| 近端VAD命中 |
+>   |---|---|---|---|
+>   | 纯回声 43-46s | 25.9dB | **25.8dB** | 1% |
+>   | 纯回声2 52-57s | 11.2dB | **11.2dB** | 20%（低rho帧，无害）|
+>   | 纯本端 27-31s | 0.0dB | **0.0dB** | 0% |
+>   | 混合 3-10s | 4.0dB | **4.0dB** | 29%（正确检出双讲）|
+>   结论：**加双讲保护、回声零回归**；混合段压制未大降是因为该窗口前段被收敛期
+>   静音主导、基线压制本就 mild，持续真实双讲下软压保留本端的效果会更明显。
+> - `tool/gate_offline.dart` 增 A/B 与调参入口：`... [echo_lag] [ref_lead]
+>   [dtlk=true/false] [vadMargin=10]`，并打印各段近端 VAD 命中率。
+> - `dart analyze` 四文件 0 issue。
+
+
+**Tier 2（服务端，收益最大）**：**修 `appapi.zhiyuexc.com/audiowss` 的
+2~3.6s 单向延迟**。TRTC/Agora/Ali 全部前提单向 <400ms；延迟不修，任何按
+小延迟设计的 AEC 都追不上，我们只能靠本地播放参考的门兜底——门的压制上限
+就是对话体验的天花板。这是**当前最高优先级的外部依赖**。
+
+**Tier 3（下一代，需资源）**：NN 残余抑制（GCCRN/ICCRN 后滤波器）替换/叠加
+correlation gate，NN 啸叫抑制（对标 `grulite_howling`）。需要模型 + 训练数据，
+非本轮范围。
+
+**结论**：Tier 0（已做）+ Tier 1（收敛期静音，**已实现并离线验证无回归**）就是
+**当前可交付的稳定版**；Tier 2 是服务端必须跟进的前提；Tier 3 记为路线图。
+待真机在线后按第十五/十六节复测要点验收即可。
+
+## 十七、TRTC 怎么播放 + 是否要把 FlutterPcmSound 换成 TRTC（2026-11-12 晚）
+
+### TRTC 的播放路线（闭源包 strings + 头文件实证）
+TRTC **自己拥有整条渲染链路**，不是把 PCM 丢给系统播放器：
+- **Android = AAudio**：`AAudioPlayer`/`AAudioRecorder`、`AAudioStreamBuilder_
+  setSessionId`/`setSharingMode`、`aaudio.mmap_exclusive_policy`、
+  `aaudio_performance_mode`。mmap 独占 + 低延迟性能模式，采集与播放共用
+  session，时钟同源。
+- **播放轨直接喂 AEC 参考**（reference co-source）：`Add audio playout track
+  when audio playout started`、`aec data feed playout lack/recover`、
+  `current diff between capture and playout is: %d, capture count … playout
+  count …`、`AecStereoReferencePcmStrategy`。播放线程产出的 PCM **就是** AEC
+  的参考，采集/播放样本数差被实时跟踪对齐。
+- **自定义渲染**：`enableCustomAudioRendering(true)` +
+  `getCustomAudioRenderingFrame(TRTCAudioFrame*)`，头文件明确「**建议由系统的
+  音频播放线程直接驱动该函数的调用**，播放完一帧即取下一帧」。即渲染节拍由
+  系统音频时钟驱动，不是 Dart/UI 定时器。
+- **外部参考兜底**：`appendExternalReferencePCM` /
+  `AppendExternalReferencePCMSync` —— 当参考不是自家播放轨时，把外部 PCM 显式
+  灌进 AEC 当参考。`setLowLatencyModeEnabled` 进一步压渲染延迟。
+
+一句话：**TRTC 播放的核心价值 = 参考与扬声器字节同源 + 系统音频时钟驱动对齐**，
+而不是「播放器本身音质更好」。
+
+### 我们现在的播放路线（已实证）
+`AudioPlaybackManager` → `flutter_pcm_sound`（独立 AudioUnit/AAudio 流，**与
+采集不是同一个**）。但关键的一步我们已经做了：
+- `audio_playback_manager.dart:207` `_doFeed` 在喂扬声器**之前**，把**同一份**
+  已过 volume/duck/fade 的字节经 `onPlaybackReference` 交出去；
+- → `handsfree_room_page.dart:462 _forwardReference` → worker `ref_chunk`
+  → `audio_processing_worker.dart:389/391` **同时** `aec.pushReference` +
+  `gate.pushReference`。
+
+这正是 TRTC `appendExternalReferencePCM` 那条路的**应用层等价实现**：参考与
+扬声器字节同源。门的延迟搜索因此只需追**播放缓冲**（~100ms），与网络延迟无关。
+
+### 是否替换：结论 = **不必整体换**
+| 维度 | 换 TRTC 播放 | 维持 FlutterPcmSound + 本地参考 |
+|---|---|---|
+| 参考同源 | 引擎级原生 | **已用 onPlaybackReference 达成等价** |
+| 时钟对齐 | 系统音频线程驱动，最紧 | Dart 5ms 泵 + 门两段式 lag 搜索（±240/±120/0）吸收抖动 |
+| 代价 | 引入**整个 SDK/引擎**（非单播放器）、license、包体、与自研 AEC3+门链路冲突 | 0 |
+| 成品音质 | TRTC NS/AGC 改频响，与「48k 全带 + 自然底噪」目标冲突 | 保留已调好的全带链路 |
+
+- **参考对齐这个真问题已经解决**：iOS 之前回声的根因是 VPIO 无法引用
+  FlutterPcmSound 的独立 AudioUnit（双重损失），我们已**回退裸麦 + WebRTC AEC3
+  + 自喂参考**绕过，不再依赖 VPIO。换 TRTC 能「根治」的正是这一点，但我们已经
+  用应用层参考同源把它绕过去了。
+- **唯一真实差距**是时钟对齐精度（系统线程驱动 vs Dart 泵）。但门的动态 lag
+  搜索就是为吸收这种抖动设计的，离线实测稳态压制 25.8dB 已达标，边际收益小。
+- **换 = 丢掉已调好的链路 + 背上整个 SDK**，成本远大于收益。
+
+**建议**：不换播放器。把 TRTC 值得抄的**机制**（收敛期静音、VAD/NLP 双讲分级
+软压、参考同源）抄进自研链路即可——这些**已全部实现并离线验证**。播放路线维持
+现状。若未来真机实测发现 Dart 泵抖动导致 lag 频繁失锁，再考虑「系统音频线程
+驱动参考」的局部改造（仍不必引入 TRTC SDK）。
+
+## 十八、TRTC 音频栈全量盘点 + AI AEC 是什么 + 本轮抄回（2026-11-12 晚）
+
+> 方法：`strings` 全量扫 `libliteavsdk.so`（35560 条）+ 头文件，把 TRTC 音频
+> 处理栈彻底盘了一遍，逐条评估「能不能抄、值不值得抄」。
+
+### 18.1 AI AEC（用户问的「ai ace」）到底是什么
+TRTC 的 3A 早已不是纯传统 DSP，而是**一整套 ncnn 神经网络模型**（打包成
+`.ncnn.liteavbin`/`.liteavparams` 塞在 .so 里，运行时 ncnn + litenn 推理）：
+
+| 模块 | strings 实证 | 作用 |
+|---|---|---|
+| **AIEC**（AI 回声消除）| `aiec_60m_amdf`/`95m_amdf`/`95m_mdf`/`105m_mdf`/`80m_smdf`/`140m_mdf`、`dpgru_model_*`、`aec_level 120AI`、`is_enable_ai_ec_module`、`ai_ec_model_type` | 用 **DPGRU**（深度门控循环网络）做回声消除，替代/增强传统线性滤波器（AMDF）。`aec_level 120AI` 是 AI 档；模型无效时 `downgrade to 60` 优雅降级 |
+| **ICCRN**（残余回声后滤波）| `iccrn_model_140m_mdf_32k`/`80m_mdf`/`80m_smdf` | 线性 AEC 之后的**神经残余回声抑制 + 降噪**，即传统 NLP 的 AI 替代 |
+| **AINS**（AI 降噪）| `ains_dccrn`（深度复数卷积循环网络）、`ains_percepnet`（PercepNet，Opus/RNNoise 血统）、`adaptive_ans_mode`、`big stable noise detected. enable denoise` | 神经降噪；**自适应**——只在检出「大而稳的噪声」时才开，避免误伤人声 |
+| **AIVAD**（AI 语音检测）| `aivad`/`aivad2`、`kEnableAIVad`、`TapAivadProcessor_Process` | 神经 VAD，驱动双讲判决（`nearend unmute`）与 3A 门控 |
+| **grulite_howling** | `grulite_howling_16k.bin`、`trae_howling_grulite16k` | 神经啸叫抑制（GRU-lite）|
+| **ai_music_detect** | `percepnet_music_detect`、`non_music_detected_session_count` | 区分音乐/语音，音乐时不激进降噪 |
+| 其它 | `ai-dred`（深度冗余/丢包补偿）、`ai-uplink-bicubic`（上行超分）、`ai-voice-protection`、`ai-super-ns`、`snr_estimation`、`kws` | 丢包 concealment、上行 16k→48k 超分等 |
+
+**为什么 AI AEC 是关键差距**：AI-AEC 把回声消得很干净 → **残余≈本端** → 单靠
+电平 VAD 就能判双讲（TRTC 的做法）。我们用 WebRTC AEC3 **线性**滤波，外放场景
+残余重（20~25dB 封顶），电平分不清「响回声」与「响本端」，所以必须叠加 **rho
+相关性上限**兜底（见第十六节调参教训）。这就是我们与 TRTC 的本质差距。
+
+**能不能抄 AI 模型？不能。** 这些是腾讯**专有训练权重**，ncnn 格式打包在 .so
+内（加密 blob），无公开模型文件、无 ncnn 运行时、无训练数据，且本环境禁止装
+第三方原生包。我们能抄的是**架构思想**（用传统 DSP 近似），不是模型本身。
+
+### 18.2 TRTC 全部可参考机制 × 评估（能抄/已抄/不抄）
+
+| TRTC 机制（strings 实证）| 类型 | 我们现状 | 评估 / 动作 |
+|---|---|---|---|
+| `aec_beginning_mute` / `convergence_mute` / `EC:mute data 1 second` | 传统 | ✅ 已抄（收敛期静音）| 第十六节 |
+| `aec_nlp_level` / `nlp level` 分级 | 传统 | ✅ 已抄（rho 分级软压）| 第十六节 |
+| `nearend unmute` / `aivad` 双讲 | 传统+AI | ✅ 已抄（电平+rho VAD）| 第十六节 |
+| `appendExternalReferencePCM` 参考同源 | 传统 | ✅ 已等价（onPlaybackReference）| 第十七节 |
+| **`aec data feed playout lack/recover`** 参考断流 | 传统 | ❌→✅ **本轮抄回** | 见 18.3 |
+| `reset tap processor since too much diff between capture and playout` | 传统 | 部分（门 lag 搜索自带滞回/拒绝坏峰）| 我们采集/参考本就异步，cap-playout 样本差不适用；已用 lag 搜索健康度覆盖 |
+| `reset linear filter because of delay change` | 传统 | 门每 100ms 重搜 + 滞回跟随 | hardSync 丢的是**未喂**字节，已喂音频的回声 lag 不变 → 不需要重置（已核实）|
+| `reset linear filter because of divergence` | 传统 | — | **不抄**：无法可靠区分「AEC 发散」与「正常远端单讲」，门压制已覆盖后者，误触发反而打断对话 |
+| 自适应 jitter buffer（`Increase/Decrease target cache … avg_jitter`、`speed rate` catch-up）| 传统 | 固定 100ms + 500ms hardSync 丢弃 | **暂缓**：变速 catch-up 与我们 AEC3 参考对齐冲突（变速=延迟持续漂移，正是我们当初删 1.25x 的原因）；根因是服务端 2~3.6s 延迟（Tier 2）。真机若见播放卡顿再评估「只调缓冲深度、不变速」的保守版 |
+| `audio_io_watchdog` / `thread_watchdog` | 基础设施 | Dart isolate + 插件自带线程管理 | **不抄**：对单 isolate 链路边际收益小，记路线图 |
+| `ebur128 agc`（LUFS 响度 AGC）| 传统 | AGC 默认关 | **不抄**：AGC 在啸叫回路里会把振荡托回稳态（见 worker kUpstreamAgc 注释）|
+| `adaptive_ans_mode` / `big stable noise → denoise` | 传统+AI | NoiseGate（谷值追踪底噪门）| **不抄谱减 NS**：会改频响、伤「48k 全带 + 自然底噪」成品bar；我们的底噪门已是电平域自适应，够用 |
+| `ai_music_detect` 音乐门控 NS | AI | NS 关 | 不适用（NS 未开）|
+| `soundcard mode` / 外置声卡白名单 | 传统 | 手机内置麦/扬声器 | 不适用 |
+| `tap_delay_estimate_mode` / `low power delay estimation` | 传统 | 门两段式 lag 搜索 | 已有自研等价，低功耗模式边际 |
+| `smart_3a_strategy_flag` 3A 编排 | 传统 | 静态 dart-define 开关 | 可未来做自适应编排，本轮不必要 |
+
+### 18.3 本轮抄回：参考断流守卫（playout lack/recover）
+**问题（真 bug，非假想）**：播放会停顿（网络断层 / 无新包）。停顿时参考环
+**冻结**在最后一次播放的陈旧远端字节上，已无新回声产生。但门的**能量兜底**
+（`本端电平 < 参考 - 14dB → 判纯残余硬压`）仍拿这份陈旧参考判决 —— 停顿期
+本端说话（电平低于那段陈旧远端 14dB 以上）会被**误判成残余整句压死**。
+
+**修复**（`residual_gate.dart`，对标 TRTC `aec data feed playout lack/recover`）：
+- 新增 `_framesSinceRef`：每处理一帧采集 +1，`pushReference` 时清零。
+- 超过 `refLackFrames=40`（≈400ms，远大于正常喂参考间隔 ~50ms）即判**参考断流**
+  `refLacking`，**停用能量兜底**，把判决交还 rho 路径——本端语音与陈旧远端
+  不相关，rho 自然落回 rhoNone 以下直通。
+- worker `aec_stats` 增 `gateRefLack` 上报；门 doc 增第 9 条。
+
+**验证**（`tool/gate_reflack_test.dart`，自包含合成信号，不依赖真机录音）：
+| 配置 | 停顿期本端输入 | 停顿期输出 | 压制 |
+|---|---|---|---|
+| 守卫关（refLackFrames=1e5）| -33.3dB | -67.3dB | **34.0dB（误杀）** |
+| 守卫开（refLackFrames=40）| -33.3dB | -33.3dB | **0.0dB（保留）** |
+
+→ 停顿期本端语音多保留 **33.9dB**。**正常连续喂参考时守卫是 no-op**（每 ~5 帧
+清零，永不达 40），对既有稳态压制零回归（可证：`!refLacking` 恒真 →
+`residualOnly` 表达式与改前逐字一致）。`dart analyze` 五文件 0 issue。
+
+### 18.4 稳定性结论
+- **已抄回并验证**：收敛期静音、NLP 分级软压、双讲 VAD、参考同源、**参考断流
+  守卫**（本轮）。这些是 TRTC 传统 DSP 层「值得抄」的全部，已落地。
+- **抄不了**：AI 模型栈（AIEC/ICCRN/AINS/AIVAD/grulite-howling/music-detect/
+  dred/bicubic）——专有 ncnn 权重，无运行时/无数据/禁装原生包。这是与 TRTC 的
+  **代差**，只能靠传统 DSP + 相关性兜底逼近。
+- **暂缓/不抄**：自适应 jitter buffer（变速与 AEC 参考冲突，根因在服务端延迟）、
+  发散重置（无法可靠判别）、AGC/谱减 NS（违背成品 bar 或在啸叫回路里）、watchdog
+  （边际）。均有明确理由，非遗漏。
+- **最高优先级仍是 Tier 2**：服务端 `appapi.zhiyuexc.com/audiowss` 单向 2~3.6s
+  延迟。它不修，播放侧任何缓冲策略都是band-aid，门的压制上限就是对话天花板。
+- 待真机在线：重建带本轮改动的 APK/IPA，按十五/十六节复测，并**新增一项**——
+  制造播放停顿（弱网）观察停顿期本端是否还被误压（验证 18.3）。
+
+## 十九、播放器积压兜底复审（去掉变速后，2026-11-12 晚）
+
+> 背景：变速播放（1.25x catch-up）已删（变速=延迟持续漂移，AEC3 永远在重收敛）。
+> 复审剩下的积压兜底是否够稳、会不会播放「很久之前的音频块」。
+
+### 19.1 延迟有界性（确认：不会无界积压）
+`flutter_pcm_sound` **无 flush/clear/stop API**（实测 3.3.3 只有 setup/feed/
+setFeedThreshold/setFeedCallback/start/release），native 缓冲清不掉。但延迟仍严格有界：
+- **native 缓冲**：`_doFeed` 只在 native < `targetNativeMs=100ms` 时补到 100ms，
+  feed 阈值 50ms → native 恒在 50~100ms oscillate，**上限 ~100ms（不可压缩下限）**。
+- **Dart 缓冲**：每来一包先查 `totalBacklogFrames`（native 余量 + Dart 帧），
+  超过 `hardSyncThresholdMs=500ms` 即 `hardSync()` 清空 Dart 缓冲。逐包检查 →
+  Dart 缓冲最多 500ms+1包，**绝不无界增长**。
+- **结论**：播放侧总延迟恒 ≤ ~600ms（500 Dart + 100 native）。服务端 2~3.6s
+  单向延迟是另一回事（音频到达时就那么旧），播放侧保证**不再额外叠加 >600ms**，
+  不会播放很久之前的块。
+
+### 19.2 抗抖动 / 防欠载（确认：稳定播放）
+- Dart 缓冲就是抖动垫：停包后 feed 回调（native<50ms 触发）持续把 Dart 喂进
+  native，直到 Dart 空 → **可吸收 ~500ms 的包间隔**，欠载（卡顿）只在 >500ms
+  断流时发生（opus 20ms/包，等于严重断网）。
+- 断网 >800ms 重启有 10ms 渐入；hardSync 后也有 10ms 渐入，避免不连续咔嗒。
+- `_nativeRemainingFrames` 乐观自增（_doFeed）会被回调 authoritative 值校正，
+  过估窗口 <50ms 且偏保守（只会略早 hardSync），不会导致欠载。
+
+### 19.3 本轮改进（已实现 + dart analyze 0 issue）
+1. **hardSync 不再丢当前最新包**：旧行为 `hardSync(); return;` 把触发清缓冲的
+   那一包（**最新到**的音频）也丢了。改为清完陈旧缓冲后**保留当前包**重建缓冲，
+   少损失一帧（20ms）最 live 的声音。`handleIncomingOpusPacket` 与 `handleRawPcm`
+   两条入口同改。
+2. **丢弃量诊断日志**：`hardSync` 打印「丢弃陈旧缓冲 xxms / native 余 xxms」，
+   真机据此判断丢弃是否过频（过频=服务端在猛灌 burst）。
+3. **延迟上限写进常量注释**：`hardSyncThresholdMs` 注明 ~600ms 硬上限与调参方向。
+
+### 19.4 评估过但**不改**的
+- **自适应 jitter buffer（TRTC jitter v2）**：靠变速 catch-up，与我们 AEC3 参考
+  对齐冲突（变速=延迟漂移），且根因是服务端延迟。维持「固定 500ms 上限 + 丢弃」。
+- **调小/调大阈值**：100ms native（不可 flush 的下限）+ 500ms 总上限已是
+  「贴近 live」与「抗抖动」的折中；服务端延迟主导，再调边际无感。
+- **trim 保留部分旧缓冲**：与「只播最新」目标相悖（清全部 = 只留最新，最优）。
