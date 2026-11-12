@@ -19,8 +19,13 @@ class AudioPlaybackManager {
   final int channelCount;
   final dynamic _decoder;
 
-  /// 与手机扬声器实际发出音量对齐（AEC 要消的是「响出来的声音」）
-  static const double baseVolume = 1.6;
+  /// 播放增益。**别再往上调**：外放对讲时这份字节同时是 AEC 的参考信号，
+  /// 乘 1.6 后凡峰值超过 20479 的样本都会被 clamp 硬削波，削波是不可逆的
+  /// 非线性 —— AEC 的线性自适应滤波器只匹配得上基波，削出来的谐波会当成
+  /// 近端人声留在成品里，听感就是"文件里还有对方的声音"。
+  /// 要更响请调系统媒体音量，而不是在这里放大。
+  final double baseVolume;
+  static const double defaultBaseVolume = 1.0;
   static const int fadeInDurationMs = 10;
 
   /// 底层维持的"安全垫"水位
@@ -43,7 +48,9 @@ class AudioPlaybackManager {
     this.channelCount = 1,
     required dynamic decoder,
     this.onPlaybackReference,
-  }) : _decoder = decoder;
+    double baseVolume = defaultBaseVolume,
+  })  : _decoder = decoder,
+        baseVolume = baseVolume <= 0 ? defaultBaseVolume : baseVolume;
 
   /// 参考信号回调：把「正在送给扬声器」的那份 PCM 原样交出去（WebRTC AEC3 用）。
   /// 必须与喂给底层的**同一份**数据（已过 baseVolume + 渐入）。

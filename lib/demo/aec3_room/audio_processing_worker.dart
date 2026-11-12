@@ -32,6 +32,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
     OpusEncoder? encoder;
     IOSink? fileSink;
 
+    /// 诊断用：AEC **之前**的原始采集（只在该开关打开时有值）。
+    /// 有了它就能离线直接算 ERLE / 看残余，不必靠人耳判断「还有没有回声」。
+    IOSink? rawSink;
+
     bool isWriteRecordFile = false;
     bool isFirstChunk = true;
 
@@ -66,6 +70,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
               fileSink.add(ioBuffer.takeBytes());
             }
             await fileSink?.close();
+            await rawSink?.flush();
+            await rawSink?.close();
+            rawSink = null;
             encoder?.dispose();
 
             // 每个分段开始都必须回到"首块"状态（这个 isolate 只建一次，
@@ -94,6 +101,11 @@ void audioProcessingWorker(SendPort mainSendPort) {
             if (filePath != null && filePath.isNotEmpty) {
               fileSink = File(filePath).openWrite();
             }
+            // 诊断轨道：AEC 之前的原始字节（只有显式要才开）
+            final String? rawPath = message['rawFilePath'];
+            if (rawPath != null && rawPath.isNotEmpty) {
+              rawSink = File(rawPath).openWrite();
+            }
 
             encoder = OpusEncoder(
               sampleRate: kSampleRateUplink,
@@ -113,6 +125,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
               await fileSink.flush();
               await fileSink.close();
               fileSink = null;
+              await rawSink?.flush();
+              await rawSink?.close();
+              rawSink = null;
               // 告诉主线程「这段文件的字节已经全部落盘」，导出 wav 必须等它，
               // 否则会读到缺尾巴的文件（wav 头里的长度是对的，内容却短一截）。
               mainSendPort.send({'type': 'file-closed'});
@@ -126,6 +141,12 @@ void audioProcessingWorker(SendPort mainSendPort) {
 
             // 🔴 回声消除必须发生在写盘与编码之前：外放时扬声器漏进麦克风的
             //    对方声音一旦写进 .pcm 就是永久性成品污染，后处理修不回来。
+            if (rawSink != null) {
+              // 诊断轨道写的是 AEC 之前的原样字节，用来离线算真实 ERLE
+              try {
+                rawSink.add(chunk);
+              } catch (_) {}
+            }
             if (aec != null) {
               bytesIn += chunk.length;
               pendingCaptureTime ??= captureTime;
@@ -221,6 +242,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
               await fileSink.close();
               fileSink = null;
             }
+            await rawSink?.flush();
+            await rawSink?.close();
+            rawSink = null;
             encoder?.dispose();
             encoder = null;
             // AEC3 句柄必须跟着 isolate 一起收回，否则每次开录漏一份滤波器内存

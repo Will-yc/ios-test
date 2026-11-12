@@ -2,17 +2,12 @@ name: AEC3 build check
 
 # 只验证「能不能编过、符号有没有真的链进去」，不签名、不出包。
 # 双平台各跑一遍：Android 用 NDK 编 .so，iOS 用 Xcode 编静态库 + 桥接。
+#
+# 🔴 只留手动触发：本仓库的分工是「GitHub 出 iOS IPA（ios-release.yml），
+#    Android 一律本机打包」，所以不再跟着 push 自动跑。真怀疑某个 ABI 编不过
+#    时到 Actions 页面手动 Run 一次即可。
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - 'lib/**'
-      - 'packages/native_aec/**'
-      - 'pubspec.yaml'
-      - 'ios/**'
-      - 'android/**'
-      - '.github/workflows/aec3-build-check.yml'
 
 jobs:
   android:

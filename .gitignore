@@ -66,3 +66,6 @@ application-my.yaml
 
 # Flutter 生成物
 .flutter-plugins-dependencies
+
+# 本地临时脚本/分析产物
+.workbuddy/

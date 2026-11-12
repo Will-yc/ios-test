@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:math' as math;
 
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/material.dart';
@@ -43,6 +44,34 @@ const String kDefaultRoomId = String.fromEnvironment(
   'ROOM_ID',
   defaultValue: 'aec3test',
 );
+
+/// 参考信号延迟补偿（ms）——**这是外放回声能不能消掉的关键，不是调参**。
+///
+/// AEC 只能消「参考帧 ↔ 采集帧按时间对齐」的那部分回声。播放侧的字节是先
+/// 交给 FlutterPcmSound，再经过 native 缓冲（targetNativeMs=100）、
+/// AudioTrack 缓冲、扬声器、空气、麦克风，真机实测要 **321~352ms** 之后才会
+/// 出现在采集流里。补偿 0 时 AEC 看到的是「参考比回声早 350ms」，线性滤波器
+/// 与延迟估计器都对不上，于是整段回声原样留在成品里 —— 听感就是「文件里有
+/// 对方的声音」。
+///
+/// 推 250ms 后表观延迟剩 ~100ms（正延迟，AEC3 自己的延迟估计器能吃掉），
+/// e2e 自测页实测 ERLE 24.6dB。**不能推满 352**：估偏一点就变成负延迟，
+/// AEC 无法处理，效果会突然崩到 0。要用别的值就
+/// `--dart-define=REF_DELAY_MS=300`（宁可偏小，别偏大）。
+const int kRefDelayMs = int.fromEnvironment('REF_DELAY_MS', defaultValue: 250);
+
+/// 播放增益（百分比）。默认 100 = 不放大。
+///
+/// 送进扬声器的字节同时就是 AEC 的参考信号。原来固定乘 1.6，峰值一过
+/// 20479 就被 clamp 硬削波；削波是不可逆非线性，AEC 的线性滤波器只对得上
+/// 基波，谐波会原样留在成品里（听感 = 还有对方的声音）。
+/// 想更响请调系统媒体音量，**不要**把这个值往 150、200 调。
+const int kPlayGainPct = int.fromEnvironment('PLAY_GAIN_PCT', defaultValue: 100);
+
+/// 诊断开关：把 AEC **之前**的原始采集也落一份 `_raw.pcm`，
+/// 重测后可以拿两份文件直接算出真实 ERLE，不用再靠听感判断。
+/// （统一用 String 比较：这个工程里 bool.fromEnvironment 读 dart-define 曾静默失效）
+const bool kKeepRaw = String.fromEnvironment('KEEP_RAW') == 'true';
 
 enum _Phase { idle, starting, live, stopping, done }
 
@@ -92,6 +121,18 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   // ---------- AEC 观测 ----------
   double _inDbfs = -90;
   double _outDbfs = -90;
+  int _aecFrames = 0;
+  int _aecStarved = 0;
+  int _aecBytesIn = 0;
+  int _aecBytesOut = 0;
+
+  // ---------- 参考信号延迟队列 ----------
+  // 播放侧交来的字节先压 kRefDelayMs 再喂 AEC（详见 kRefDelayMs 注释）。
+  // 按 10ms 小块排队，让到达时刻精确到 AEC 自己的帧长，避免整块 100ms
+  // 一起到期导致块内对齐误差最大 100ms。
+  final List<MapEntry<int, Uint8List>> _refQ = <MapEntry<int, Uint8List>>[];
+  final Stopwatch _refClock = Stopwatch();
+  Timer? _refTimer;
 
   // ---------- 页面状态 ----------
   _Phase _phase = _Phase.idle;
@@ -125,6 +166,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _uiTimer?.cancel();
+    _stopRefPump();
     _statusSub?.cancel();
     _textSub?.cancel();
     _binarySub?.cancel();
@@ -262,6 +304,10 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           setState(() {
             _inDbfs = (message['inDbfs'] as num?)?.toDouble() ?? -90;
             _outDbfs = (message['outDbfs'] as num?)?.toDouble() ?? -90;
+            _aecFrames = (message['frames'] as num?)?.toInt() ?? 0;
+            _aecStarved = (message['starved'] as num?)?.toInt() ?? 0;
+            _aecBytesIn = (message['bytesIn'] as num?)?.toInt() ?? 0;
+            _aecBytesOut = (message['bytesOut'] as num?)?.toInt() ?? 0;
           });
           break;
         case 'file-closed':
@@ -281,10 +327,60 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     );
   }
 
+  /// 播放侧回调：把「即将送给扬声器的同一份字节」压 kRefDelayMs 后再交给 AEC。
+  ///
+  /// 直接转发（delay=0）会让参考比回声早 350ms，AEC 完全失效 —— 这是实测里
+  /// 「成品还带着对方声音」的唯一原因。
   void _forwardReference(Uint8List pcm) {
     final port = _workerSendPort;
     if (port == null || _isWorkerClosed || pcm.isEmpty) return;
-    port.send({'type': 'ref_chunk', 'data': pcm});
+
+    if (kRefDelayMs <= 0) {
+      port.send({'type': 'ref_chunk', 'data': pcm});
+      return;
+    }
+    // 泵已停（结束导出 / 还没开始）：不再排队，否则队列只增不发白占内存
+    if (!_refClock.isRunning) return;
+
+    const int frameBytes = kSampleRateRecorder ~/ 100 * 2; // 10ms 一块
+    final int base = _refClock.elapsedMilliseconds + kRefDelayMs;
+    int lastDue = _refQ.isEmpty ? 0 : _refQ.last.key;
+    for (int off = 0; off < pcm.length; off += frameBytes) {
+      final int end = math.min(off + frameBytes, pcm.length);
+      // 块内偏移也要算进到期时刻，否则整块 100ms 同时到期
+      final int offMs = (off ~/ 2) * 1000 ~/ kSampleRateRecorder;
+      int due = base + offMs;
+      // 严格保序：SendPort 是 FIFO，AEC 侧也是按帧顺序取用，
+      // 一旦乱序就会永久错位（AEC 不会自己纠正队列顺序）。
+      if (due <= lastDue) due = lastDue + 1;
+      lastDue = due;
+      _refQ.add(MapEntry(due, Uint8List.sublistView(pcm, off, end)));
+    }
+  }
+
+  /// 启动参考信号泵。必须在播放器建好**之前**调用 ——
+  /// `_forwardReference` 用 `_refClock` 打时间戳，时钟要先跑起来。
+  void _startRefPump() {
+    _stopRefPump();
+    _refClock
+      ..reset()
+      ..start();
+    if (kRefDelayMs <= 0) return;
+    _refTimer = Timer.periodic(const Duration(milliseconds: 5), (_) {
+      final port = _workerSendPort;
+      if (port == null) return;
+      final int now = _refClock.elapsedMilliseconds;
+      while (_refQ.isNotEmpty && now >= _refQ.first.key) {
+        port.send({'type': 'ref_chunk', 'data': _refQ.removeAt(0).value});
+      }
+    });
+  }
+
+  void _stopRefPump() {
+    _refTimer?.cancel();
+    _refTimer = null;
+    _refClock.stop();
+    _refQ.clear();
   }
 
   // =====================================================================
@@ -301,9 +397,14 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       _gotMicData = false;
       _inDbfs = -90;
       _outDbfs = -90;
+      _aecFrames = 0;
+      _aecStarved = 0;
+      _aecBytesIn = 0;
+      _aecBytesOut = 0;
       _logs.clear();
     });
     _log('开始：room=${_roomCtrl.text.trim()} user=$_userId');
+    _log('参考补偿 ${kRefDelayMs}ms（端到端 ~350ms，留 ~100ms 给 AEC 自己估）');
 
     try {
       if (!await _recorder.hasPermission()) {
@@ -329,10 +430,14 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
         channels: Channels.mono,
       );
       await _playbackManager?.dispose();
+      // 参考信号泵一定要在建播放器之前起：播放第一块就会回调 _forwardReference，
+      // 那时 _refClock 必须已经在走，否则整条时间轴从负数起步。
+      _startRefPump();
       _playbackManager = AudioPlaybackManager(
         sampleRate: kSampleRateRecorder,
         channelCount: kChannels,
         decoder: _decoder,
+        baseVolume: kPlayGainPct / 100.0,
         onPlaybackReference: _forwardReference,
       );
       await _playbackManager!.init();
@@ -343,10 +448,22 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
         await _recorder.stop();
         await Future<void>.delayed(const Duration(milliseconds: 150));
       }
-      final mic = await DualUtil.findBuiltInMicNew(
-        recorder: _recorder,
-        audioSession: _audioSession,
-      );
+      // 采集设备：默认 **不指定**，让 record 走 Android 的 DEFAULT 通路。
+      //
+      // 实测（PMA120）指定内置麦（内部会 setPreferredDevice）之后，playAndRecord
+      // 下的这条输入通路被系统按「通话」处理：带宽硬截到 16k（16k 以上恒为
+      // 数字零），并且 2k 以上的语音被压掉 30~40dB，成品听感发闷、缺齿音。
+      // 对照实验：e2e 自测页不指定 device，同一台机器能录到 22k 的完整带宽。
+      // 需要复核这个结论时加 --dart-define=PIN_MIC=true 恢复旧行为。
+      // 注意必须用 String.fromEnvironment：bool.fromEnvironment 只认字面量
+      // true/false，读不到 --dart-define 传进来的字符串，开关会静默失效。
+      const bool pinMic = String.fromEnvironment('PIN_MIC') == 'true';
+      final mic = pinMic
+          ? await DualUtil.findBuiltInMicNew(
+              recorder: _recorder,
+              audioSession: _audioSession,
+            )
+          : null;
       final stream = await _recorder.startStream(
         RecordConfig(
           encoder: AudioEncoder.pcm16bits,
@@ -412,6 +529,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     _workerSendPort?.send({
       'type': 'init',
       'filePath': path,
+      // 诊断轨道：AEC 之前的原始采集（KEEP_RAW=true 才有）
+      'rawFilePath':
+          kKeepRaw ? path.replaceAll(RegExp(r'\.pcm$'), '_raw.pcm') : null,
       'aecEnabled': true,
     });
     _workerSendPort?.send({
@@ -434,6 +554,10 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     // 1. 先断采集，再关文件：否则关文件之后还会有一两块写进来
     await _micSub?.cancel();
     _micSub = null;
+    _stopRefPump();
+    _log('AEC 汇总: 帧=$_aecFrames 缺参考=$_aecStarved '
+        '样本 ${_aecBytesIn ~/ 2}→${_aecBytesOut ~/ 2}（差 '
+        '${(_aecBytesIn - _aecBytesOut) ~/ 2} 样本，应 < 480）');
     try {
       await _recorder.stop();
     } catch (e) {
@@ -498,6 +622,100 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     } on TimeoutException {
       _log('⚠️ 等文件关闭超时，wav 可能缺尾巴');
     }
+  }
+
+  /// 清空本 App 自己的录音目录里所有 `handsfree_*` 成品（pcm / wav / _raw.pcm）。
+  ///
+  /// 只扫应用文档目录的第一层，只删本页产出的命名前缀，不碰别的东西；
+  /// 删除不可恢复，所以先列数量+体积让用户确认。
+  Future<void> _deleteAllFiles() async {
+    if (_phase == _Phase.live || _busy) {
+      _toast('正在对讲，先结束再删除');
+      return;
+    }
+
+    final List<File> files;
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      if (!dir.existsSync()) {
+        _toast('没有可删除的文件');
+        return;
+      }
+      files = dir
+          .listSync(followLinks: false)
+          .whereType<File>()
+          .where((f) {
+            final name = f.uri.pathSegments.last;
+            return name.startsWith('handsfree_') &&
+                (name.endsWith('.pcm') || name.endsWith('.wav'));
+          })
+          .toList()
+        ..sort((a, b) => a.path.compareTo(b.path));
+    } catch (e) {
+      _log('❌ 扫描文件失败: $e');
+      _toast('扫描文件失败');
+      return;
+    }
+
+    if (files.isEmpty) {
+      _toast('没有可删除的文件');
+      return;
+    }
+
+    int totalBytes = 0;
+    for (final f in files) {
+      try {
+        totalBytes += f.lengthSync();
+      } catch (_) {}
+    }
+    final sizeMb = totalBytes / 1024 / 1024;
+
+    if (!mounted) return;
+    final bool? ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除所有录音文件？'),
+        content: Text(
+          '将要删除 ${files.length} 个文件，共 ${sizeMb.toStringAsFixed(1)} MB，'
+          '包含已导出的 wav。此操作不可恢复。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            style: TextButton.styleFrom(
+              foregroundColor: Theme.of(ctx).colorScheme.error,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('全部删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+
+    int deleted = 0;
+    final List<String> failed = [];
+    for (final f in files) {
+      try {
+        await f.delete();
+        deleted++;
+      } catch (_) {
+        failed.add(f.uri.pathSegments.last);
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _wavPath = '';
+      _pcmPath = null;
+      _pcmBytes = 0;
+    });
+    _log('🧹 已删除 $deleted 个文件（${sizeMb.toStringAsFixed(1)} MB）'
+        '${failed.isEmpty ? '' : '，失败 ${failed.length} 个'}');
+    _toast(failed.isEmpty ? '已删除 $deleted 个文件' : '删除 $deleted 个，${failed.length} 个失败');
   }
 
   Future<void> _share() async {
@@ -643,6 +861,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           title: const Text('无耳机对讲实测'),
           actions: [
             IconButton(
+              tooltip: '删除所有录音文件',
+              onPressed: _busy ? null : _deleteAllFiles,
+              icon: const Icon(Icons.delete_sweep_outlined),
+            ),
+            IconButton(
               tooltip: '离开',
               onPressed: _busy ? null : _confirmExit,
               icon: const Icon(Icons.logout),
@@ -680,7 +903,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
         child: Text(
           '两台设备都别戴耳机、音量开到常用大小。一端选 A、一端选 B，'
           '房间号必须一样。开始后直接说话，成品里只会剩本端人声。\n'
-          '前 1~2 秒是 AEC 收敛期，导出时保留原样。',
+          '前 1~2 秒是 AEC 收敛期，导出时保留原样。\n'
+          '外放音量越大，麦克风拾到的回声越强，AEC 能压掉的比例是固定的 —— '
+          '想听感更干净就把系统音量调小一档。',
           style: TextStyle(color: cs.onSecondaryContainer, height: 1.45),
         ),
       );
@@ -807,6 +1032,12 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
                   ? '—'
                   : '${(_inDbfs - _outDbfs).toStringAsFixed(1)} dB',
             ),
+            _row('AEC 帧', _aecFrames == 0 ? '—' : '$_aecFrames（缺参考 $_aecStarved）'),
+            _row(
+              '参考补偿',
+              '${kRefDelayMs}ms',
+              ok: kRefDelayMs > 0,
+            ),
             const Divider(height: 18),
             _row('录制时长', _fmt(_elapsed)),
             _row('本段大小', _pcmBytes == 0 ? '—' : '${(_pcmBytes / 1024).round()} KB'),
@@ -864,8 +1095,15 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
                   ),
                   const SizedBox(width: 10),
                   IconButton.filledTonal(
+                    tooltip: '复制路径',
                     onPressed: () => _copy(_wavPath),
                     icon: const Icon(Icons.copy),
+                  ),
+                  const SizedBox(width: 6),
+                  IconButton.filledTonal(
+                    tooltip: '删除所有录音文件',
+                    onPressed: _busy ? null : _deleteAllFiles,
+                    icon: const Icon(Icons.delete_sweep_outlined),
                   ),
                 ],
               ),
