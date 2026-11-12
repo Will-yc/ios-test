@@ -31,10 +31,16 @@ class AudioPlaybackManager {
   static const double defaultBaseVolume = 1.0;
   static const int fadeInDurationMs = 10;
 
-  /// 底层维持的"安全垫"水位
+  /// 底层维持的"安全垫"水位。native 缓冲在 50~100ms 间 oscillate（feed 阈值 50ms）。
   static const int targetNativeMs = 100;
 
-  /// 总延迟超过这个值就硬追平
+  /// 总延迟（native 余量 + Dart 缓冲）超过这个值就硬追平（清空 Dart 缓冲）。
+  ///
+  /// **这就是播放侧延迟的硬上限**：Dart 缓冲最多攒到 ~500ms 即被清掉，native
+  /// 那 ~100ms 无法清（插件无 flush API），所以播放侧总延迟恒 ≤ ~600ms，
+  /// **不会无界积压、不会播放很久之前的音频块**。服务端 2~3.6s 单向延迟是另一
+  /// 回事（音频到达时就已经那么旧），播放侧只能保证不再额外叠加超过 ~600ms。
+  /// 调小→更贴近 live 但丢弃更频繁；调大→更平滑但延迟更高。500ms 是折中。
   static const int hardSyncThresholdMs = 500;
 
   bool _isRunning = false;
@@ -120,9 +126,12 @@ class AudioPlaybackManager {
     }
     _lastPacketTime = now;
 
+    // 积压超阈值 → 清掉陈旧的 Dart 缓冲，保住「只播最新、不播很久之前的块」。
+    // **但不丢当前包**：当前包是最新到的音频，清完缓冲正好用它重建，否则白白
+    // 损失一帧（20ms）最 live 的声音（旧行为 hardSync 后直接 return 把当前包也丢了）。
+    // native 已喂的那 ~100ms 无法清（插件无 flush API），是延迟的不可压缩下限。
     if (totalBacklogFrames > _msToFrames(hardSyncThresholdMs)) {
       hardSync();
-      return;
     }
 
     try {
@@ -143,18 +152,22 @@ class AudioPlaybackManager {
   /// 「正在送给扬声器的同一份字节」—— AEC 对比实验的前提。
   void handleRawPcm(Uint8List pcm) {
     if (!_isRunning || !_isInitialized || pcm.isEmpty) return;
+    // 同 handleIncomingOpusPacket：积压超阈值清陈旧缓冲，但保留当前（最新）数据。
     if (totalBacklogFrames > _msToFrames(hardSyncThresholdMs)) {
       hardSync();
-      return;
     }
     _playbackBuffer.add(pcm);
     _tryFillNativeAnchor();
   }
 
   void hardSync() {
+    // 诊断：记录这次丢掉了多少陈旧缓冲（真机上据此判断丢弃是否过频）。
+    final double droppedMs =
+        (_playbackBuffer.length ~/ (2 * channelCount)) / sampleRate * 1000;
     _playbackBuffer.clear();
     _fadeInSamplesRemaining = _msToFrames(fadeInDurationMs);
-    debugPrint('🔥 强制追平，当前总延迟 ${currentDelayMs.toStringAsFixed(1)}ms');
+    debugPrint('🔥 强制追平：丢弃陈旧缓冲 ${droppedMs.toStringAsFixed(0)}ms，'
+        'native 余 ${currentDelayMs.toStringAsFixed(0)}ms（不可清）');
   }
 
   void _tryFillNativeAnchor() {
