@@ -50,6 +50,12 @@ const bool kResidualGate =
 const bool kHowlNotch =
     String.fromEnvironment('HOWL_NOTCH', defaultValue: 'true') == 'true';
 
+/// 陷波频率下限（Hz）。**低于这个值一律不挖** —— 人声基频 80~400Hz、
+/// 低次谐波 400~1200Hz 都在这之下；实测啸叫落在 1.5~3kHz。
+/// 真机回归：页面检测器曾把 375Hz（男声基频）锁成啸叫，挖掉 −22dB 后
+/// 人声发空、听感明显变差。页面侧已按频段 + 连续确认过滤，这里是兜底。
+const double kNotchMinHz = 1200.0;
+
 /// 上行 AGC 开关。默认**关**。
 ///
 /// 它原本只为补偿 iOS 裸麦的数字增益，但在外放对讲里它处在环路内部：
@@ -301,8 +307,15 @@ void audioProcessingWorker(SendPort mainSendPort) {
 
           case 'howl_notch':
             // 页面侧守卫检出的啸叫频点（可能多个），直接下发给陷波器。
+            // 第二道闸：低于 [kNotchMinHz] 的目标一律丢弃。人声基频（80~400Hz）
+            // 与低次谐波都在下面，挖了等于把人说话挖空 —— 真机上 375Hz 被锁过
+            // 一次，人声直接发空。页面侧已按频段+连续确认过滤，这里兜底。
             final List<dynamic> hz = (message['hz'] as List<dynamic>?) ?? const [];
-            notch?.setTargets(hz.map((e) => (e as num).toDouble()).toList());
+            final List<double> targets = hz
+                .map((e) => (e as num).toDouble())
+                .where((f) => f >= kNotchMinHz)
+                .toList();
+            notch?.setTargets(targets);
             mainSendPort.send({
               'type': 'howl_notch_ack',
               'active': notch?.activeHz ?? const <double>[],

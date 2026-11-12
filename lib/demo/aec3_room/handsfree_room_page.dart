@@ -453,14 +453,27 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   /// 检测器只做一件事：把守卫已经算出来的「窄带峰频」收集成一组陷波目标。
   ///
   /// 判据（全部来自 [LoopGainGuard] 已有的读数，不新增 FFT）：
-  /// - 守卫判到起振（isDucking），或窄峰相对邻带高出 [peakQGate] dB；
-  /// - 峰频落在 150Hz ~ 6kHz；
+  /// - 窄峰相对邻带高出 [peakQGate] dB（**不再看 isDucking**：那是「能量在涨」
+  ///   的粗判据，正常说话也会触发，真机上它把陷波带到男声基频上去了）；
+  /// - 峰频落在 [notchMinHz] ~ [notchMaxHz]（**下限 1200Hz 是硬约束**：
+  ///   人声基频 80~400Hz、低次谐波 400~1200Hz 全在下面，挖了就是把人说话
+  ///   挖空；实测啸叫在 1.5~3kHz，1200 不会漏）；
+  /// - 同一频点（±[notchStreakHz]）要**连续 [notchConfirmTicks] 次**（250ms×3
+  ///   =750ms）都被判可疑才真正下发。语音的峰频每几十毫秒就换，啸叫会钉住
+  ///   一个点，这一条把人声的瞬态峰全过滤掉；
   /// - 同一频点 ±[mergeHz] 内不重复挖，最多同时挖 3 个；
   /// - 6 秒没再被确认的频点自动淘汰（worker 侧会平滑淡出，不会咔嗒）。
   static const double peakQGate = 14.0;
   static const double mergeHz = 120.0;
   static const int maxTargets = 3;
   static const int staleMs = 6000;
+  static const double notchMinHz = 1200.0;
+  static const double notchMaxHz = 6000.0;
+  static const double notchStreakHz = 60.0;
+  static const int notchConfirmTicks = 3;
+
+  /// 频点网格 → 连续命中次数。只有连续命中够次数才允许锁频。
+  final Map<int, int> _notchStreak = <int, int>{};
 
   void _startNotchDetector() {
     _stopNotchDetector();
@@ -468,10 +481,26 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     _notchTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
       if (!mounted || _phase != _Phase.live) return;
       final double hz = _guard.lastPeakHz;
-      final bool suspicious = _guard.isDucking ||
-          (_guard.lastPeakQDb >= peakQGate && _guard.captureDbfs > -55);
-      if (suspicious && hz > 150 && hz < 6000) {
-        _rememberNotch(hz);
+      final bool inBand = hz >= notchMinHz && hz <= notchMaxHz;
+      final bool peaky =
+          _guard.lastPeakQDb >= peakQGate && _guard.captureDbfs > -55;
+      if (inBand && peaky) {
+        final int key = (hz / notchStreakHz).round();
+        // 允许频点在 ±2 个网格（≈±120Hz）内漂移时延续计数：啸叫会小幅抖动，
+        // 若死认一个格子，抖动一次就归零，永远凑不够确认次数。
+        int carried = 0;
+        _notchStreak.forEach((k, v) {
+          if ((k - key).abs() <= 2 && v > carried) carried = v;
+        });
+        _notchStreak
+          ..clear()
+          ..[key] = carried + 1;
+        if (_notchStreak[key]! >= notchConfirmTicks) {
+          _rememberNotch(hz);
+        }
+      } else {
+        // 任一条不成立就清空计数：语音的峰频跳得快，攒不够连续次数
+        _notchStreak.clear();
       }
       _expireNotch();
       _workerSendPort?.send({
@@ -519,6 +548,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     _notchTimer?.cancel();
     _notchTimer = null;
     _notchSeen.clear();
+    _notchStreak.clear();
     _notchTargets.clear();
   }
 
