@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:my_flutter_app/demo/util/my_dual_resampler_rate.dart';
 import 'package:native_aec/native_aec.dart';
+import 'package:my_flutter_app/demo/aec3_room/howl_notch.dart';
 import 'package:my_flutter_app/demo/aec3_room/residual_gate.dart';
 import 'package:opus_ffi/opus_ffi.dart';
 
@@ -36,6 +37,27 @@ const bool kHighBandBypass =
 /// 用 `--dart-define=RESIDUAL_GATE=false` 可退回纯 AEC3 行为做对照。
 const bool kResidualGate =
     String.fromEnvironment('RESIDUAL_GATE', defaultValue: 'true') == 'true';
+
+/// 采集侧啸叫陷波开关。默认开。
+///
+/// 两台设备**不在同一空间**也照样啸叫，因为回路不是靠「两机之间的空气」闭合的：
+///   A 麦 → 上行 → B 外放 → B 麦 → 上行 → A 外放 → A 麦
+/// 声耦合只发生在各自「自己的扬声器→自己的麦克风」，房间不共享切不断这条环。
+/// AEC3 若没把这段自回声消干净（参考延迟对不上就会这样），回路增益 >1 就自激，
+/// 且峰频会在 1.5~3kHz 之间跳 —— 听感是一整片吼叫/杂音，不是单音哨。
+/// 这一层把「已确认的啸叫窄峰」直接挖掉，把该频点的环路增益压到 1 以下。
+/// 用 `--dart-define=HOWL_NOTCH=false` 退回旧行为做 A/B。
+const bool kHowlNotch =
+    String.fromEnvironment('HOWL_NOTCH', defaultValue: 'true') == 'true';
+
+/// 上行 AGC 开关。默认**关**。
+///
+/// 它原本只为补偿 iOS 裸麦的数字增益，但在外放对讲里它处在环路内部：
+/// 啸叫一起来，AGC 就把被压下去的振荡重新拉回稳态，振荡永远熄不掉
+/// （实测两端的 1.9kHz 包络稳定在 −33dBFS 长达 30 秒、并伴 3.5Hz 抽吸）。
+/// 需要时用 `--dart-define=UPSTREAM_AGC=true` 打开。
+const bool kUpstreamAgc =
+    String.fromEnvironment('UPSTREAM_AGC', defaultValue: 'false') == 'true';
 
 /// 后台音频处理与 I/O 线程（必须是顶层函数）。
 ///
@@ -75,7 +97,14 @@ void audioProcessingWorker(SendPort mainSendPort) {
 
     // 上行 AGC 只在 iOS 启用（补偿 iOS 裸麦相对 Android 缺失的数字增益）。
     // 它只作用于「上行 opus」那条新 buffer，落盘 .pcm 一个采样都不变。
-    final _UpstreamAgc? upstreamAgc = Platform.isIOS ? _UpstreamAgc() : null;
+    // 默认关：它处在啸叫回路里，会把振荡托在稳态（见 kUpstreamAgc 注释）。
+    final _UpstreamAgc? upstreamAgc =
+        (Platform.isIOS && kUpstreamAgc) ? _UpstreamAgc() : null;
+
+    // 采集侧啸叫陷波（AEC 之后）。null = 不启用。
+    final HowlNotch? notch = kHowlNotch
+        ? HowlNotch(sampleRate: kSampleRateRecorder)
+        : null;
 
     // 外放回声消除（WebRTC AEC3）。null = 直通（未启用或库不可用）。
     Aec3Processor? aec;
@@ -137,6 +166,8 @@ void audioProcessingWorker(SendPort mainSendPort) {
               gate = null;
             }
             gate?.reset();
+            // 陷波器跨分段保留会带着上一段的振荡状态，这里一并清掉
+            notch?.reset();
 
             final String? filePath = message['filePath'];
             if (filePath != null && filePath.isNotEmpty) {
@@ -157,6 +188,8 @@ void audioProcessingWorker(SendPort mainSendPort) {
               'type': 'init-over',
               'highBandBypass': aec?.highBandBypassEnabled ?? false,
               'residualGate': gate != null,
+              'howlNotch': notch != null,
+              'upstreamAgc': upstreamAgc != null,
             });
             break;
 
@@ -201,6 +234,11 @@ void audioProcessingWorker(SendPort mainSendPort) {
               captureTime = pendingCaptureTime;
               pendingCaptureTime = null;
               bytesOut += chunk.length;
+            }
+
+            // 采集侧啸叫陷波：把已确认的自激窄峰挖掉（上行与成品同时生效）。
+            if (notch != null && chunk.isNotEmpty) {
+              chunk = notch.process(chunk);
             }
 
             // 下行相关门：把 AEC 漏掉的残余回声「整帧压低」。只影响落盘成品。
@@ -259,6 +297,16 @@ void audioProcessingWorker(SendPort mainSendPort) {
             // 延迟标定结束后重置 AEC（标定那 3s 故意不喂参考，滤波器状态已失效）。
             // 只重置算法句柄，绝不动 fileSink / encoder，否则成品会断流。
             aec?.reset();
+            break;
+
+          case 'howl_notch':
+            // 页面侧守卫检出的啸叫频点（可能多个），直接下发给陷波器。
+            final List<dynamic> hz = (message['hz'] as List<dynamic>?) ?? const [];
+            notch?.setTargets(hz.map((e) => (e as num).toDouble()).toList());
+            mainSendPort.send({
+              'type': 'howl_notch_ack',
+              'active': notch?.activeHz ?? const <double>[],
+            });
             break;
 
           case 'ref_chunk':

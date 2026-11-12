@@ -143,6 +143,15 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   bool _highBandBypass = false;
   // 下行相关门（成品彻底无回声）是否开启
   bool _residualGate = false;
+  // 采集侧啸叫陷波是否在岗（worker 回报）
+  bool _howlNotch = false;
+  // 上行 AGC 是否在岗（默认关：它会把啸叫托在稳态）
+  bool _upstreamAgc = false;
+  // 当前真正在挖的陷波频点
+  List<double> _notchHz = const <double>[];
+  // 检测器下发给 worker 的频点集合（去重、带淘汰）
+  final List<double> _notchTargets = <double>[];
+  Timer? _notchTimer;
 
   // ---------- 采集侧闭环增益守卫 ----------
   // 喂的是 AEC **之前**的原始采集；duck 系数由播放器在 _doFeed 里读取。
@@ -200,6 +209,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     _uiTimer?.cancel();
     _calibActive = false;
     _stopRefPump();
+    _stopNotchDetector();
     _statusSub?.cancel();
     _textSub?.cancel();
     _binarySub?.cancel();
@@ -338,6 +348,15 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           setState(() {
             _highBandBypass = message['highBandBypass'] == true;
             _residualGate = message['residualGate'] == true;
+            _howlNotch = message['howlNotch'] == true;
+            _upstreamAgc = message['upstreamAgc'] == true;
+          });
+          break;
+        case 'howl_notch_ack':
+          if (!mounted) return;
+          final List<dynamic> act = (message['active'] as List<dynamic>?) ?? const [];
+          setState(() {
+            _notchHz = act.map((e) => (e as num).toDouble()).toList();
           });
           break;
         case 'aec_stats':
@@ -425,6 +444,82 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     _refTimer = null;
     _refClock.stop();
     _refQ.clear();
+  }
+
+  // =====================================================================
+  // 采集侧啸叫陷波：检测器 → worker
+  // =====================================================================
+
+  /// 检测器只做一件事：把守卫已经算出来的「窄带峰频」收集成一组陷波目标。
+  ///
+  /// 判据（全部来自 [LoopGainGuard] 已有的读数，不新增 FFT）：
+  /// - 守卫判到起振（isDucking），或窄峰相对邻带高出 [peakQGate] dB；
+  /// - 峰频落在 150Hz ~ 6kHz；
+  /// - 同一频点 ±[mergeHz] 内不重复挖，最多同时挖 3 个；
+  /// - 6 秒没再被确认的频点自动淘汰（worker 侧会平滑淡出，不会咔嗒）。
+  static const double peakQGate = 14.0;
+  static const double mergeHz = 120.0;
+  static const int maxTargets = 3;
+  static const int staleMs = 6000;
+
+  void _startNotchDetector() {
+    _stopNotchDetector();
+    if (!_howlNotch) return; // worker 没开这一层就没必要发
+    _notchTimer = Timer.periodic(const Duration(milliseconds: 250), (_) {
+      if (!mounted || _phase != _Phase.live) return;
+      final double hz = _guard.lastPeakHz;
+      final bool suspicious = _guard.isDucking ||
+          (_guard.lastPeakQDb >= peakQGate && _guard.captureDbfs > -55);
+      if (suspicious && hz > 150 && hz < 6000) {
+        _rememberNotch(hz);
+      }
+      _expireNotch();
+      _workerSendPort?.send({
+        'type': 'howl_notch',
+        'hz': List<double>.from(_notchTargets),
+      });
+    });
+  }
+
+  final Map<double, int> _notchSeen = <double, int>{};
+
+  void _rememberNotch(double hz) {
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    for (final double k in _notchSeen.keys.toList()) {
+      if ((k - hz).abs() <= mergeHz) {
+        _notchSeen[k] = now; // 同一频点，只刷新时间
+        return;
+      }
+    }
+    _notchSeen[hz] = now;
+    if (_notchSeen.length > maxTargets) {
+      // 淘汰最久没被确认的那个（啸叫频率会跳，只留最近出现的）
+      final keys = _notchSeen.keys.toList()
+        ..sort((a, b) => _notchSeen[a]!.compareTo(_notchSeen[b]!));
+      _notchSeen.remove(keys.first);
+    }
+    _log('🔪 陷波锁定 ${hz.toStringAsFixed(0)}Hz（可选 '
+        '${_notchSeen.keys.map((e) => e.toStringAsFixed(0)).join("/")}）');
+  }
+
+  void _expireNotch() {
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    _notchSeen.removeWhere((_, t) => now - t > staleMs);
+    final List<double> next = _notchSeen.keys.toList()..sort();
+    if (next.length != _notchTargets.length ||
+        !Iterable<int>.generate(next.length)
+            .every((i) => (next[i] - _notchTargets[i]).abs() < 1)) {
+      _notchTargets
+        ..clear()
+        ..addAll(next);
+    }
+  }
+
+  void _stopNotchDetector() {
+    _notchTimer?.cancel();
+    _notchTimer = null;
+    _notchSeen.clear();
+    _notchTargets.clear();
   }
 
   // =====================================================================
@@ -547,6 +642,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
 
       if (!mounted) return;
       setState(() => _phase = _Phase.live);
+      _startNotchDetector();
       _log('🎙️ 对讲中（AEC3 已开），可以开口说话了');
       Future<void>.delayed(const Duration(seconds: 5), () {
         if (!mounted || _phase != _Phase.live) return;
@@ -628,6 +724,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     await _micSub?.cancel();
     _micSub = null;
     _stopRefPump();
+    _stopNotchDetector();
     _log('AEC 汇总: 帧=$_aecFrames 缺参考=$_aecStarved '
         '样本 ${_aecBytesIn ~/ 2}→${_aecBytesOut ~/ 2}（差 '
         '${(_aecBytesIn - _aecBytesOut) ~/ 2} 样本，应 < 480）');
@@ -1262,6 +1359,20 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
               '残留门',
               _residualGate ? '开 · 成品彻底无回声' : '关 · 仅 AEC3',
               ok: _residualGate,
+            ),
+            _row(
+              '啸叫陷波',
+              !_howlNotch
+                  ? '关'
+                  : (_notchHz.isEmpty
+                      ? '待命 · 未检出'
+                      : '挖 ${_notchHz.map((e) => e.toStringAsFixed(0)).join('/')}Hz'),
+              ok: _howlNotch,
+            ),
+            _row(
+              '上行 AGC',
+              _upstreamAgc ? '开 · 会把啸叫托在稳态' : '关 · 环路里不补增益',
+              ok: !_upstreamAgc,
             ),
             const Divider(height: 18),
             _row(
