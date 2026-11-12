@@ -35,7 +35,8 @@ jobs:
         run: flutter pub get
 
       - name: Build APK (debug, arm64)
-        run: flutter build apk --debug --target-platform android-arm64
+        # ROOM_TEST=true：这个 APK 直接拿去跑「无耳机对讲实测」页
+        run: flutter build apk --debug --target-platform android-arm64 --dart-define=ROOM_TEST=true --dart-define=ROOM_ID=aec3test
 
       - name: Assert native libs are packaged
         run: |

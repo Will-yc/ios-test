@@ -252,15 +252,18 @@ jobs:
           security find-identity -v -p codesigning
           
           # 构建（不再 flutter clean，前面已经 pub get）
+          # ROOM_TEST=true：装好后直接进「无耳机对讲实测」页，不用手点菜单
           flutter build ipa \
             --release \
+            --dart-define=ROOM_TEST=true \
+            --dart-define=ROOM_ID=aec3test \
             --export-options-plist=ios/ExportOptions.plist
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         if: success()
         with:
-          name: iOS-IPA
+          name: iOS-IPA-room-test
           path: build/ios/ipa/*.ipa
           retention-days: 7
 

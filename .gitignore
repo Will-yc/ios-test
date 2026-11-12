@@ -63,3 +63,6 @@ application-my.yaml
 # native_aec 插件的 CMake/Gradle 缓存
 /packages/native_aec/android/.cxx/
 /packages/native_aec/android/build/
+
+# Flutter 生成物
+.flutter-plugins-dependencies

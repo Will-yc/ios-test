@@ -42,6 +42,7 @@ dependencies:
   opus_ffi: ^0.1.4
   audioplayers: ^6.1.0
   audio_session: ^0.1.25
+  path_provider: ^2.1.2
   record: ^6.2.0  # 固定版本，避免 record_android 1.4.0 带来的 Kotlin/AGP 要求
   just_audio: ^0.9.36  # 添加音频播放插件
   shelf: ^1.4.2
