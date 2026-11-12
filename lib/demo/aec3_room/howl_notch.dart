@@ -19,7 +19,7 @@ class HowlNotch {
   HowlNotch({
     this.sampleRate = 48000,
     this.maxNotches = 3,
-    this.bandwidthHz = 160.0,
+    this.bandwidthHz = 240.0,
     this.depthDb = 22.0,
   });
 

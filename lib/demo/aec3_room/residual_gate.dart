@@ -34,8 +34,8 @@ class ResidualGate {
     this.assumedDelayMs = 300,
     this.minDelayMs = 40,
     this.maxDelayMs = 620,
-    this.rhoFull = 0.50,
-    this.rhoNone = 0.16,
+    this.rhoFull = 0.40,
+    this.rhoNone = 0.10,
     this.gFloor = 0.02, // -34dB
     this.smooth = 0.6,
     this.energyDropDb = 14.0,

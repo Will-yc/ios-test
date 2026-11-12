@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 
 import 'loop_gain_guard.dart';
+import 'howl_notch.dart';
 
 /// 下行播放器（严格对齐原工程 `my_dual_audio_playback_manager.dart` 的结构，
 /// 只做了一个改动：**1.25x 变速被彻底删掉**）。
@@ -44,6 +45,10 @@ class AudioPlaybackManager {
   /// 看错了信号 —— 真机日志里一次都没触发过。
   final LoopGainGuard? guard;
 
+  /// 播放侧啸叫陷波（与采集侧同频点，页面检测器统一下发）。
+  /// 在参考信号取出**之前**作用，保证 AEC 参考与扬声器字节一致。
+  final HowlNotch? notch;
+
   final BytesBuilder _playbackBuffer = BytesBuilder();
 
   int _fadeInSamplesRemaining = 0;
@@ -56,6 +61,7 @@ class AudioPlaybackManager {
     required dynamic decoder,
     this.onPlaybackReference,
     this.guard,
+    this.notch,
     double baseVolume = defaultBaseVolume,
   })  : _decoder = decoder,
         baseVolume = baseVolume <= 0 ? defaultBaseVolume : baseVolume;
@@ -171,6 +177,9 @@ class AudioPlaybackManager {
   }
 
   void _doFeed(Uint8List chunk) {
+    // 播放侧陷波先于 duck 与参考取出：扬声器里就没有啸叫频点，
+    // 环路在这一端被挖掉 22dB，且 AEC 参考与扬声器字节仍一致。
+    if (notch != null) chunk = notch!.process(chunk);
     final Int16List pcm = chunk.buffer.asInt16List(
       chunk.offsetInBytes,
       chunk.length ~/ 2,

@@ -142,6 +142,20 @@ class LoopGainGuard {
   static const int holdFrames = 281; // ~3s 恢复
   static const int cooldownFrames = 94; // 恢复后再冷却 ~1s
 
+  // ---------- 投票式啸叫判据（容忍间歇 bursts 与跳频）----------
+  // 真机第四版录音实测：啸叫被对话/系统抑制调制成间歇窄带 bursts，
+  // 21ms 帧里 Q>=18 && ton>=0.5 的「纯啸叫帧」占比不足 40%，主判据漏判；
+  // 但放宽到 Q>=10 && ton>=0.3 后，500ms 窗内命中 3/20 帧以上只出现在啸叫期。
+  // 投票不要求频点恒定 —— 跳频（1.9↔2.2kHz）照样攒票。
+  static const double voteQDb = 10.0;
+  static const double voteTonality = 0.3;
+  static const double votePeakDbfs = -35.0; // 静音期残余回声（-44dBFS）不参与
+  static const double voteQDbStrong = 16.0;
+  static const double votePeakStrongDbfs = -30.0;
+  static const int voteWindow = 47; // ~500ms
+  static const double voteHoldRatio = 0.2; // duck 期间仍有这么多票 → 保持压低
+  static const double voteTriggerRatio = 0.35; // 独立触发门槛
+
   // ---------- 输入缓冲 ----------
   final Float64List _acc = Float64List(fftSize);
   int _accFill = 0;
@@ -162,6 +176,7 @@ class LoopGainGuard {
   final List<bool> _narrowHist = <bool>[];
   final List<double> _loopHist = <double>[];
   final List<bool> _loopValid = <bool>[];
+  final List<bool> _voteHist = <bool>[];
 
   double _renderRms = 0;
   double _duck = 1.0;
@@ -184,6 +199,10 @@ class LoopGainGuard {
   double get loopGainDb => _loopGainDb;
   int get analyzedFrames => _frames;
 
+  /// 最近 ~500ms 内「啸叫投票」帧占比。跳频/间歇啸叫的主判据。
+  double get howlVoteRatio =>
+      _voteHist.isEmpty ? 0 : _voteHist.where((v) => v).length / _voteHist.length;
+
   double _peakHz = 0;
   double _peakQDb = -90;
   double _tonality = 0;
@@ -200,6 +219,7 @@ class LoopGainGuard {
     _narrowHist.clear();
     _loopHist.clear();
     _loopValid.clear();
+    _voteHist.clear();
     _renderRms = 0;
     _duck = 1.0;
     _duckLeft = 0;
@@ -335,19 +355,30 @@ class LoopGainGuard {
     final bool narrowNow = qDb >= peakQDb &&
         _tonality >= minTonality &&
         peakDbfs >= minPeakDbfs;
-    _pushHistory(qDb, peakDbfs, lg, renderActive, narrowNow);
+    final bool voteNow = (qDb >= voteQDb &&
+            _tonality >= voteTonality &&
+            peakDbfs >= votePeakDbfs) ||
+        (qDb >= voteQDbStrong && peakDbfs >= votePeakStrongDbfs);
+    _pushHistory(qDb, peakDbfs, lg, renderActive, narrowNow, voteNow);
 
-    // 4) duck 状态机
+    // 4) duck 状态机。啸叫未熄（投票仍活跃）时保持压低，不恢复 ——
+    //    旧版固定 3s 后恢复，真机录音里振荡每次都在恢复后重新起振。
+    final double voteRatio = howlVoteRatio;
     if (_duckLeft > 0) {
-      _duckLeft--;
-      final double t = 1.0 - _duckLeft / holdFrames;
-      _duck = duckLevel + (1.0 - duckLevel) * t;
+      if (voteRatio >= voteHoldRatio) {
+        _duckLeft = holdFrames;
+        _duck = duckLevel;
+      } else {
+        _duckLeft--;
+        final double t = 1.0 - _duckLeft / holdFrames;
+        _duck = duckLevel + (1.0 - duckLevel) * t;
+      }
     } else {
       _duck = 1.0;
     }
     if (_cooldown > 0) _cooldown--;
 
-    if (_duckLeft > 0 || _cooldown > 0 || _qHist.length < riseFrames) return;
+    if (_cooldown > 0 || _qHist.length < riseFrames) return;
 
     // 5) 主判据：最近 200ms 内「窄带主导」帧占比
     int narrow = 0;
@@ -365,15 +396,19 @@ class LoopGainGuard {
     );
     final double need = gainRising ? narrowRatioFast : narrowRatio;
 
-    if (ratio >= need) {
+    if (_duckLeft == 0 &&
+        (ratio >= need || voteRatio >= voteTriggerRatio)) {
       _duckLeft = holdFrames;
       _cooldown = holdFrames + cooldownFrames;
       _duck = duckLevel;
       _triggerCount++;
-      _lastReason = gainRising
-          ? '窄带主导 ${(ratio * 100).round()}% + 环路增益上升'
-          : '窄带主导 ${(ratio * 100).round()}% @ '
-              '${_peakHz.toStringAsFixed(0)}Hz Q=${qDb.toStringAsFixed(1)}dB';
+      _lastReason = voteRatio >= voteTriggerRatio
+          ? '啸叫投票 ${(voteRatio * 100).round()}% @ '
+              '${_peakHz.toStringAsFixed(0)}Hz'
+          : gainRising
+              ? '窄带主导 ${(ratio * 100).round()}% + 环路增益上升'
+              : '窄带主导 ${(ratio * 100).round()}% @ '
+                  '${_peakHz.toStringAsFixed(0)}Hz Q=${qDb.toStringAsFixed(1)}dB';
     }
   }
 
@@ -383,12 +418,14 @@ class LoopGainGuard {
     double lg,
     bool renderActive,
     bool narrow,
+    bool vote,
   ) {
     _qHist.add(qDb);
     _peakDbHist.add(peakDbfs);
     _narrowHist.add(narrow);
     _loopHist.add(lg);
     _loopValid.add(renderActive);
+    _voteHist.add(vote);
     if (_qHist.length > riseFrames) {
       _qHist.removeAt(0);
       _peakDbHist.removeAt(0);
@@ -396,6 +433,7 @@ class LoopGainGuard {
       _loopHist.removeAt(0);
       _loopValid.removeAt(0);
     }
+    if (_voteHist.length > voteWindow) _voteHist.removeAt(0);
   }
 
   /// 窗口内「有效帧占比 >= narrowRatio」且「后 1/3 均值 − 前 1/3 均值 >= minRise」。

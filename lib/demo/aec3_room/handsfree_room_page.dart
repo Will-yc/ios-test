@@ -10,6 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:my_flutter_app/demo/aec3_room/audio_playback_manager.dart';
 import 'package:my_flutter_app/demo/aec3_room/audio_processing_worker.dart';
 import 'package:my_flutter_app/demo/aec3_room/delay_calibrator.dart';
+import 'package:my_flutter_app/demo/aec3_room/howl_notch.dart';
 import 'package:my_flutter_app/demo/aec3_room/loop_gain_guard.dart';
 import 'package:my_flutter_app/demo/aec3_room/room_socket.dart';
 import 'package:my_flutter_app/demo/aec3_room/wav_export.dart';
@@ -68,19 +69,42 @@ final int kRefDelayMs = int.fromEnvironment(
   defaultValue: Platform.isAndroid ? 250 : 100,
 );
 
-/// 播放增益**硬上限 = 100%（不放大）**。
+/// 播放增益默认 **70%**（参考 TRTC：通话档播放音量默认 50，从不拉满）。
 ///
 /// 送进扬声器的字节同时就是 AEC 的参考信号。原来固定乘 1.6，峰值一过
 /// 20479 就被 clamp 硬削波；削波是不可逆非线性，AEC 的线性滤波器只对得上
 /// 基波，谐波会原样留在成品里。更关键的是：客户端放大直接抬高声学闭环增益，
 /// 真机时间线已证实「音量推到 4 档 → 3 秒后啸叫起振」。
+/// 环路增益与播放音量成正比：100%→70% 直接给环路 −3dB 余量。
 /// 因此即便 dart-define 传 PLAY_GAIN_PCT=200，这里也钳到 100；
 /// 想更响请调系统媒体音量（那部分由采集侧守卫动态 duck 兜底）。
 const int kMaxPlayGainPct = 100;
 final int kPlayGainPct = math.min(
-  int.fromEnvironment('PLAY_GAIN_PCT', defaultValue: 100),
+  int.fromEnvironment('PLAY_GAIN_PCT', defaultValue: 70),
   kMaxPlayGainPct,
 );
+
+/// 系统 3A 开关（参考 TRTC：通话一律走系统 AEC/NS/AGC，而不是裸麦）。
+///
+/// 第四版真机实测证明：我们自己的 AEC3 在「网络环路啸叫」面前 ERLE≈0 ——
+/// 环路一圈 ~1.1s，远超 AEC3 的延迟跟踪能力，滤波器根本收敛不上。
+/// TRTC 之所以不啸叫，是因为它的上行**永远**经过系统 3A：
+///   - Android：VOICE_COMMUNICATION 采集源 + AcousticEchoCanceler/
+///     NoiseSuppressor/AGC 效果，系统 AEC 用的是 HAL 里真实的播放参考，
+///     不需要我们猜 REF_DELAY，收敛快、尾长覆盖好；
+///   - iOS：VPIO（setVoiceProcessingEnabled，即 voiceChat 档），同一套东西。
+/// 系统 AEC 把「本端扬声器→本端麦」这一跳的回声压得更干净，回传给对端的
+/// 残余更小，整个网络环路的增益就被压到 1 以下。
+///
+/// 实现上分平台：
+///   - Android：**双流**。成品链保持裸麦 48k + 我们的 AEC3（保住 20kHz
+///     音质，这是已验收的指标）；另开一条 16k VOICE_COMMUNICATION 流，
+///     系统 3A 处理后直接编码上行。该流失败/全零 3s 自动回退旧上行。
+///   - iOS：系统不允许两条采集流，只能单流开 VPIO（echoCancel=true）。
+///     代价是采集带宽可能被系统压到语音档（TRTC 通话同样如此），
+///     我们的 AEC3/门链保留作第二层。--dart-define=SYS_3A=false 可回退 A/B。
+const bool kSys3A =
+    String.fromEnvironment('SYS_3A', defaultValue: 'true') == 'true';
 
 /// 诊断开关：把 AEC **之前**的原始采集也落一份 `_raw.pcm`，
 /// 重测后可以拿两份文件直接算出真实 ERLE，不用再靠听感判断。
@@ -114,6 +138,19 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   AudioPlaybackManager? _playbackManager;
   StreamSubscription<Uint8List>? _micSub;
   bool _gotMicData = false;
+
+  // ---------- 系统 3A 上行流（仅 Android，见 kSys3A）----------
+  // 第二条采集流：16k VOICE_COMMUNICATION + 系统 AEC/NS/AGC，直接编码上行。
+  // 成品仍走第一条裸麦 48k 流，两条流互不影响（record 插件按实例隔离）。
+  final AudioRecorder _uplinkRecorder = AudioRecorder();
+  StreamSubscription<Uint8List>? _uplinkSub;
+  OpusEncoder? _uplinkEncoder;
+  final BytesBuilder _uplinkBuf = BytesBuilder();
+  bool _sysUplinkActive = false;
+  DateTime? _uplinkLastDataAt;
+  // 连续「全数字零」的起点：真麦即使被 NS 压过也不会连续 3s 输出纯零，
+  // 只有采集通路被系统抢占/静音时才会 —— 用它触发回退，而不是误判安静。
+  DateTime? _uplinkZeroSince;
 
   // ---------- worker ----------
   Isolate? _audioIsolate;
@@ -166,6 +203,10 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   // 喂的是 AEC **之前**的原始采集；duck 系数由播放器在 _doFeed 里读取。
   final LoopGainGuard _guard = LoopGainGuard();
   int _lastTriggerCount = 0;
+
+  // 播放侧陷波：与采集侧陷波同频点。环路「本端麦→上行→对方外放→对方麦」
+  // 每一端各挖一次，一圈 44dB，比单端挖更快熄振。
+  final HowlNotch _playNotch = HowlNotch();
 
   // ---------- 参考延迟：运行时可调 + 一键标定 ----------
   int _refDelayMs = kRefDelayMs;
@@ -223,7 +264,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     _textSub?.cancel();
     _binarySub?.cancel();
     _micSub?.cancel();
+    _uplinkSub?.cancel();
+    _uplinkBuf.clear();
+    _uplinkEncoder?.dispose();
     _recorder.dispose();
+    _uplinkRecorder.dispose();
     _playbackManager?.dispose();
     _socket.disconnect();
     // worker 还要 await flush 才关文件，别抢在前面 kill
@@ -344,6 +389,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       if (message is! Map) return;
       switch (message['type']) {
         case 'opus_packet':
+          // 系统 3A 上行流在岗时，上行由那条流直接编码（见 _onUplinkChunk），
+          // worker 这份丢弃；回退后自动恢复转发。
+          if (_sysUplinkActive) break;
           // 标定期间本端在放 PN 序列，别把它发给对端（对方会听到一段噪声）
           if (_socketStatus == RoomSocketStatus.connected && !_calibActive) {
             _socket.sendBinaryMessage(message['data']);
@@ -464,30 +512,27 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   // 采集侧啸叫陷波：检测器 → worker
   // =====================================================================
 
-  /// 检测器只做一件事：把守卫已经算出来的「窄带峰频」收集成一组陷波目标。
+  /// 检测器只做一件事：把守卫的「啸叫投票」结果收集成一组陷波目标。
   ///
   /// 判据（全部来自 [LoopGainGuard] 已有的读数，不新增 FFT）：
-  /// - 窄峰相对邻带高出 [peakQGate] dB（**不再看 isDucking**：那是「能量在涨」
-  ///   的粗判据，正常说话也会触发，真机上它把陷波带到男声基频上去了）；
+  /// - 最近 500ms 啸叫投票占比 >= [voteGate]（投票容忍间歇 bursts 与跳频，
+  ///   真机第四版录音里啸叫被对话调制成间歇窄带，旧的「单频点连续 750ms」
+  ///   判据在 1.9↔2.2kHz 跳频下永远攒不够计数，25s 才锁上一次）；
   /// - 峰频落在 [notchMinHz] ~ [notchMaxHz]（**下限 1200Hz 是硬约束**：
   ///   人声基频 80~400Hz、低次谐波 400~1200Hz 全在下面，挖了就是把人说话
-  ///   挖空；实测啸叫在 1.5~3kHz，1200 不会漏）；
-  /// - 同一频点（±[notchStreakHz]）要**连续 [notchConfirmTicks] 次**（250ms×3
-  ///   =750ms）都被判可疑才真正下发。语音的峰频每几十毫秒就换，啸叫会钉住
-  ///   一个点，这一条把人声的瞬态峰全过滤掉；
+  ///   挖空；实测啸叫在 1.5~3.8kHz）；
+  /// - 采集电平 > -35dBFS：静音期的残余回声（-44dBFS）不配锁频，
+  ///   旧版曾在安静段把 1406Hz 残响锁成啸叫；
   /// - 同一频点 ±[mergeHz] 内不重复挖，最多同时挖 3 个；
   /// - 6 秒没再被确认的频点自动淘汰（worker 侧会平滑淡出，不会咔嗒）。
-  static const double peakQGate = 14.0;
+  /// 锁定的频点同时下发给**采集侧与播放侧**两个陷波器：环路是
+  /// 「A 麦→上行→B 外放→B 麦」，两端各挖 22dB，一圈 44dB，振荡必熄。
+  static const double voteGate = 0.25;
   static const double mergeHz = 120.0;
   static const int maxTargets = 3;
   static const int staleMs = 6000;
   static const double notchMinHz = 1200.0;
   static const double notchMaxHz = 6000.0;
-  static const double notchStreakHz = 60.0;
-  static const int notchConfirmTicks = 3;
-
-  /// 频点网格 → 连续命中次数。只有连续命中够次数才允许锁频。
-  final Map<int, int> _notchStreak = <int, int>{};
 
   void _startNotchDetector() {
     _stopNotchDetector();
@@ -496,27 +541,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       if (!mounted || _phase != _Phase.live) return;
       final double hz = _guard.lastPeakHz;
       final bool inBand = hz >= notchMinHz && hz <= notchMaxHz;
-      final bool peaky =
-          _guard.lastPeakQDb >= peakQGate && _guard.captureDbfs > -55;
-      if (inBand && peaky) {
-        final int key = (hz / notchStreakHz).round();
-        // 允许频点在 ±2 个网格（≈±120Hz）内漂移时延续计数：啸叫会小幅抖动，
-        // 若死认一个格子，抖动一次就归零，永远凑不够确认次数。
-        int carried = 0;
-        _notchStreak.forEach((k, v) {
-          if ((k - key).abs() <= 2 && v > carried) carried = v;
-        });
-        _notchStreak
-          ..clear()
-          ..[key] = carried + 1;
-        if (_notchStreak[key]! >= notchConfirmTicks) {
-          _rememberNotch(hz);
-        }
-      } else {
-        // 任一条不成立就清空计数：语音的峰频跳得快，攒不够连续次数
-        _notchStreak.clear();
-      }
+      final bool howly =
+          _guard.howlVoteRatio >= voteGate && _guard.captureDbfs > -35;
+      if (inBand && howly) _rememberNotch(hz);
       _expireNotch();
+      _playNotch.setTargets(List<double>.from(_notchTargets));
       _workerSendPort?.send({
         'type': 'howl_notch',
         'hz': List<double>.from(_notchTargets),
@@ -530,7 +559,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     final int now = DateTime.now().millisecondsSinceEpoch;
     for (final double k in _notchSeen.keys.toList()) {
       if ((k - hz).abs() <= mergeHz) {
-        _notchSeen[k] = now; // 同一频点，只刷新时间
+        // 同一频点小幅漂移：跟到新值，陷波器内部会平滑过渡
+        _notchSeen.remove(k);
+        _notchSeen[hz] = now;
         return;
       }
     }
@@ -562,8 +593,8 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     _notchTimer?.cancel();
     _notchTimer = null;
     _notchSeen.clear();
-    _notchStreak.clear();
     _notchTargets.clear();
+    _playNotch.reset();
   }
 
   // =====================================================================
@@ -625,6 +656,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
         decoder: _decoder,
         baseVolume: kPlayGainPct / 100.0,
         guard: _guard,
+        notch: _playNotch,
         onPlaybackReference: _forwardReference,
       );
       await _playbackManager!.init();
@@ -651,6 +683,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
               audioSession: _audioSession,
             )
           : null;
+      // iOS 只允许一条采集流：SYS_3A 开启时直接在这条流上启用 VPIO
+      // （record 插件把 echoCancel=true 映射成 inputNode.setVoiceProcessingEnabled，
+      // 即 TRTC voiceChat 档的系统 AEC+NS；autoGain 映射 VPIO AGC）。
+      // Android 这条流保持裸麦（成品要 20kHz 带宽），系统 3A 走第二条上行流。
+      final bool ios3A = kSys3A && Platform.isIOS;
       final stream = await _recorder.startStream(
         RecordConfig(
           encoder: AudioEncoder.pcm16bits,
@@ -664,9 +701,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
             audioSource: AndroidAudioSource.mic,
             audioManagerMode: AudioManagerMode.modeNormal,
           ),
-          autoGain: false,
-          echoCancel: false,
-          noiseSuppress: false,
+          autoGain: ios3A,
+          echoCancel: ios3A,
+          noiseSuppress: ios3A,
         ),
       );
       _micSub = stream.listen(
@@ -675,6 +712,14 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           _log('❌ 采集流错误: $e');
         },
       );
+      if (ios3A) {
+        _log('🛡️ iOS 系统 3A（VPIO）已开：采集先经系统 AEC/NS/AGC');
+      }
+
+      // Android：第二条上行流（系统 3A），失败自动回退 worker 上行
+      if (kSys3A && Platform.isAndroid) {
+        await _startSysUplink();
+      }
 
       // 进房（地址里带不带端口都行，RoomSocketManager 直接透传）
       final url = _urlCtrl.text.trim();
@@ -724,6 +769,131 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     });
   }
 
+  // =====================================================================
+  // 系统 3A 上行流（Android 双流方案，参考 TRTC 通话档）
+  // =====================================================================
+
+  /// 开第二条采集流：16k + VOICE_COMMUNICATION + 系统 AEC/NS/AGC。
+  ///
+  /// 为什么不动 AudioManager 全局模式（保持 modeNormal）：
+  /// MODE_IN_COMMUNICATION 会改整机路由/音量策略，可能把第一条裸麦流和
+  /// flutter_pcm_sound 的播放一起带偏（听筒路由/音量骤降）。TRTC 敢设是因为
+  /// 它独占整条音频管线；我们是混合管线，只用「采集源 + 效果器」这一层，
+  /// AcousticEchoCanceler 挂在采集会话上即可生效，不依赖全局模式。
+  Future<void> _startSysUplink() async {
+    try {
+      final stream = await _uplinkRecorder.startStream(
+        RecordConfig(
+          encoder: AudioEncoder.pcm16bits,
+          sampleRate: kSampleRateUplink,
+          numChannels: 1,
+          androidConfig: const AndroidRecordConfig(
+            audioSource: AndroidAudioSource.voiceCommunication,
+            audioManagerMode: AudioManagerMode.modeNormal,
+          ),
+          echoCancel: true,
+          noiseSuppress: true,
+          autoGain: true,
+        ),
+      );
+      _uplinkEncoder?.dispose();
+      _uplinkEncoder = OpusEncoder(
+        sampleRate: kSampleRateUplink,
+        channels: Channels.mono,
+        application: Application.voip,
+      );
+      _uplinkBuf.clear();
+      _uplinkZeroSince = null;
+      _uplinkLastDataAt = DateTime.now();
+      _sysUplinkActive = true;
+      _uplinkSub = stream.listen(
+        _onUplinkChunk,
+        onError: (Object e) {
+          _log('❌ 系统3A上行流错误: $e');
+          _fallbackSysUplink('流错误');
+        },
+      );
+      _log('🛡️ 系统3A上行已开（VOICE_COMMUNICATION + AEC/NS/AGC，16k）');
+    } catch (e) {
+      _log('⚠️ 系统3A上行流启动失败，回退 worker 上行: $e');
+      _sysUplinkActive = false;
+    }
+  }
+
+  /// 上行流数据：攒满 20ms（16k×320 样本）就编码发包。
+  /// 同时做「通路死亡」检测：连续 3s 纯数字零 → 回退。
+  void _onUplinkChunk(Uint8List chunk) {
+    if (!_sysUplinkActive || chunk.isEmpty) return;
+    final now = DateTime.now();
+    _uplinkLastDataAt = now;
+
+    // 全零检测：真麦有环境底噪，NS 之后也不会是纯零；纯零 = 通路被抢占
+    bool allZero = true;
+    for (int i = 0; i < chunk.length; i++) {
+      if (chunk[i] != 0) {
+        allZero = false;
+        break;
+      }
+    }
+    if (allZero) {
+      _uplinkZeroSince ??= now;
+      if (now.difference(_uplinkZeroSince!).inMilliseconds >= 3000) {
+        _fallbackSysUplink('连续 3s 全零（采集通路疑似被系统抢占）');
+        return;
+      }
+    } else {
+      _uplinkZeroSince = null;
+    }
+
+    // 标定期间不上行（与 worker 上行同规则）
+    if (_calibActive) return;
+    if (_socketStatus != RoomSocketStatus.connected) return;
+
+    _uplinkBuf.add(chunk);
+    const int frameBytes = 320 * 2; // 16k 下 20ms
+    while (_uplinkBuf.length >= frameBytes) {
+      final all = _uplinkBuf.takeBytes();
+      final frame = Uint8List.sublistView(all, 0, frameBytes);
+      if (all.length > frameBytes) {
+        _uplinkBuf.add(Uint8List.sublistView(all, frameBytes));
+      }
+      final enc = _uplinkEncoder;
+      if (enc == null) return;
+      try {
+        final pcm = Int16List.view(frame.buffer, frame.offsetInBytes, 320);
+        final pkt = enc.encode(pcm, inputSize: 320);
+        _socket.sendBinaryMessage(pkt);
+      } catch (e) {
+        _log('❌ 系统3A上行编码失败: $e');
+        _fallbackSysUplink('编码失败');
+        return;
+      }
+    }
+  }
+
+  /// 回退：关掉第二条流，恢复转发 worker 的 opus 包（worker 一直在编码，
+  /// 只是被 _sysUplinkActive 挡着没发，回退即刻生效，无断档）。
+  void _fallbackSysUplink(String reason) {
+    if (!_sysUplinkActive) return;
+    _sysUplinkActive = false;
+    _log('⚠️ 系统3A上行回退（$reason），改用 AEC3+底噪门上行');
+    _stopSysUplink();
+  }
+
+  Future<void> _stopSysUplink() async {
+    _sysUplinkActive = false;
+    await _uplinkSub?.cancel();
+    _uplinkSub = null;
+    _uplinkBuf.clear();
+    _uplinkEncoder?.dispose();
+    _uplinkEncoder = null;
+    try {
+      if (await _uplinkRecorder.isRecording()) {
+        await _uplinkRecorder.stop();
+      }
+    } catch (_) {}
+  }
+
   Future<void> _beginRecordFile() async {
     final dir = await getApplicationDocumentsDirectory();
     final now = DateTime.now();
@@ -768,6 +938,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     _calibActive = false;
     await _micSub?.cancel();
     _micSub = null;
+    await _stopSysUplink();
     _stopRefPump();
     _stopNotchDetector();
     _log('AEC 汇总: 帧=$_aecFrames 缺参考=$_aecStarved '
@@ -963,7 +1134,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           avAudioSessionCategoryOptions:
               AVAudioSessionCategoryOptions.allowBluetooth |
                   AVAudioSessionCategoryOptions.defaultToSpeaker,
-          avAudioSessionMode: AVAudioSessionMode.defaultMode,
+          // SYS_3A：iOS 走 voiceChat（= TRTC 通话档，系统 VPIO 做 AEC/NS/AGC）。
+          // defaultMode 是裸麦，回声/啸叫全靠自己那套 AEC3，实测压不住网络环路。
+          avAudioSessionMode: (kSys3A && Platform.isIOS)
+              ? AVAudioSessionMode.voiceChat
+              : AVAudioSessionMode.defaultMode,
           avAudioSessionRouteSharingPolicy:
               AVAudioSessionRouteSharingPolicy.defaultPolicy,
           avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
@@ -1052,6 +1227,12 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     }
     if (_phase == _Phase.live && _workerSendPort != null) {
       _workerSendPort!.send({'type': 'aec_stats'});
+    }
+    // 系统3A上行流断供检测：3s 没有任何数据 → 回退（与全零检测互补）
+    if (_sysUplinkActive && _uplinkLastDataAt != null) {
+      if (DateTime.now().difference(_uplinkLastDataAt!).inMilliseconds >= 3000) {
+        _fallbackSysUplink('3s 无数据');
+      }
     }
     setState(() {
       if (_recordStartAt != null && _phase == _Phase.live) {
@@ -1432,6 +1613,17 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
                       ? '开 · 噪底 ${_noiseFloorDb.toStringAsFixed(0)}dBFS'
                       : '关'),
               ok: _audioInited && _noiseGate,
+            ),
+            _row(
+              '系统3A上行',
+              !kSys3A
+                  ? '关 · 纯 AEC3 上行'
+                  : Platform.isIOS
+                      ? '开 · iOS VPIO 单流'
+                      : (_sysUplinkActive
+                          ? '开 · VOICE_COMM 双流'
+                          : '回退 · worker 上行'),
+              ok: kSys3A && (Platform.isIOS || _sysUplinkActive),
             ),
             _row(
               '上行 AGC',

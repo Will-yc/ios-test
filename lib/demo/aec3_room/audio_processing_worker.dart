@@ -129,8 +129,13 @@ void audioProcessingWorker(SendPort mainSendPort) {
     // 不碰上行 opus。开关 FULLBAND/RESIDUAL_GATE 控制。
     ResidualGate? gate;
 
-    // 采集侧底噪门（AEC + 陷波 + 相关门之后）。上行与成品同时生效。
+    // 采集侧底噪门（AEC + 陷波 + 相关门之后）。上行一份、成品一份：
+    // 两个独立实例（各自维护噪底/增益状态），互不串状态。
+    // 旧版只把底噪门接在上行，落盘成品绕过了它 —— 真机成品静音期
+    // 只压了 1.7dB（应 ~19dB），就是这条旁路造成的。
     final NoiseGate? noiseGate =
+        kNoiseGate ? NoiseGate(sampleRate: kSampleRateRecorder) : null;
+    final NoiseGate? noiseGateOut =
         kNoiseGate ? NoiseGate(sampleRate: kSampleRateRecorder) : null;
 
     await for (final message in workerReceivePort) {
@@ -191,6 +196,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
             // 陷波器跨分段保留会带着上一段的振荡状态，这里一并清掉
             notch?.reset();
             noiseGate?.reset();
+            noiseGateOut?.reset();
 
             final String? filePath = message['filePath'];
             if (filePath != null && filePath.isNotEmpty) {
@@ -275,9 +281,14 @@ void audioProcessingWorker(SendPort mainSendPort) {
 
             // 下行相关门：给落盘成品用的那一份（上行不经过它 ——
             // 对讲时把对方声音整段压掉会让对讲变成半双工，成品干净就够了）。
-            final Uint8List outChunk = (gate != null && chunk.isNotEmpty)
+            // 判决基于未被底噪门压过的真实能量；底噪门在相关门**之后**
+            // 作用于成品，顺序与文档一致：AEC→陷波→相关门→底噪门→落盘。
+            Uint8List outChunk = (gate != null && chunk.isNotEmpty)
                 ? gate.process(chunk)
                 : chunk;
+            if (noiseGateOut != null && outChunk.isNotEmpty) {
+              outChunk = noiseGateOut.process(outChunk);
+            }
 
             // =================== 1. 文件写入（成品：AEC 后的 48k pcm）===================
             if (isWriteRecordFile && fileSink != null && outChunk.isNotEmpty) {
@@ -334,6 +345,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
             // 留着旧的 lag / 噪底只会在标定后头几百毫秒做错判决。
             gate?.reset();
             noiseGate?.reset();
+            noiseGateOut?.reset();
             break;
 
           case 'howl_notch':
