@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:my_flutter_app/demo/util/my_dual_resampler_rate.dart';
 import 'package:native_aec/native_aec.dart';
+import 'package:my_flutter_app/demo/aec3_room/residual_gate.dart';
 import 'package:opus_ffi/opus_ffi.dart';
 
 /// 采集采样率：48k 原始字节直接落盘（成品 .pcm 就是这个）。
@@ -26,6 +27,15 @@ const int kSampleRateUplink = 16000;
 /// 注意用 String.fromEnvironment：bool.fromEnvironment 读不到 dart-define 字符串。
 const bool kHighBandBypass =
     String.fromEnvironment('FULLBAND', defaultValue: 'true') == 'true';
+
+/// 下行相关门（成品彻底无回声）开关。默认开。
+///
+/// AEC3 按比例消回声，双讲时会漏掉远端残余 + 厂商音效非线性，成品里仍能
+/// 听到「对方的声音」。开启后，凡「与下行参考高度相关的帧」整帧压低到接近
+/// 静音，代价是双讲（双方同时说）时本端也被压低 —— 成品优先的取舍。
+/// 用 `--dart-define=RESIDUAL_GATE=false` 可退回纯 AEC3 行为做对照。
+const bool kResidualGate =
+    String.fromEnvironment('RESIDUAL_GATE', defaultValue: 'true') == 'true';
 
 /// 后台音频处理与 I/O 线程（必须是顶层函数）。
 ///
@@ -70,6 +80,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
     // 外放回声消除（WebRTC AEC3）。null = 直通（未启用或库不可用）。
     Aec3Processor? aec;
 
+    // 下行相关门（AEC 之后的「宁可错杀」清尾层）。只作用于落盘链路，
+    // 不碰上行 opus。开关 FULLBAND/RESIDUAL_GATE 控制。
+    ResidualGate? gate;
+
     await for (final message in workerReceivePort) {
       if (message is! Map) continue;
       final String type = message['type'];
@@ -112,6 +126,18 @@ void audioProcessingWorker(SendPort mainSendPort) {
               aec = null;
             }
 
+            // 下行相关门：默认开（成品彻底无回声）。--dart-define=RESIDUAL_GATE=false 可关。
+            if (kResidualGate) {
+              gate ??= ResidualGate(
+                sampleRate: kSampleRateRecorder,
+                // 参考信号已由页面侧 REF_DELAY 队列对齐，这里不再平移
+                refDelayMs: 0,
+              );
+            } else {
+              gate = null;
+            }
+            gate?.reset();
+
             final String? filePath = message['filePath'];
             if (filePath != null && filePath.isNotEmpty) {
               fileSink = File(filePath).openWrite();
@@ -130,6 +156,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
             mainSendPort.send({
               'type': 'init-over',
               'highBandBypass': aec?.highBandBypassEnabled ?? false,
+              'residualGate': gate != null,
             });
             break;
 
@@ -174,6 +201,11 @@ void audioProcessingWorker(SendPort mainSendPort) {
               captureTime = pendingCaptureTime;
               pendingCaptureTime = null;
               bytesOut += chunk.length;
+            }
+
+            // 下行相关门：把 AEC 漏掉的残余回声「整帧压低」。只影响落盘成品。
+            if (gate != null && chunk.isNotEmpty) {
+              chunk = gate.process(chunk, refAligned: true);
             }
 
             // =================== 1. 文件写入（成品：AEC 后的 48k pcm）===================
@@ -223,11 +255,19 @@ void audioProcessingWorker(SendPort mainSendPort) {
             }
             break;
 
+          case 'aec_reset':
+            // 延迟标定结束后重置 AEC（标定那 3s 故意不喂参考，滤波器状态已失效）。
+            // 只重置算法句柄，绝不动 fileSink / encoder，否则成品会断流。
+            aec?.reset();
+            break;
+
           case 'ref_chunk':
             // 播放侧喂进来的参考信号：**正在送给扬声器**的那份 PCM。
             // 与 pcm_chunk 走同一个端口，Dart 的 SendPort 是 FIFO，
             // 「先参考、后采集」的投递顺序天然成立（APM 的硬性要求）。
             aec?.pushReference(message['data']);
+            // 同时喂给下行相关门（用于判定「这帧里有多少是回声」）
+            gate?.pushReference(message['data']);
             break;
 
           case 'flush_chunk':

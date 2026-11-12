@@ -2,12 +2,15 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:isolate';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:audio_session/audio_session.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:my_flutter_app/demo/aec3_room/audio_playback_manager.dart';
 import 'package:my_flutter_app/demo/aec3_room/audio_processing_worker.dart';
+import 'package:my_flutter_app/demo/aec3_room/delay_calibrator.dart';
+import 'package:my_flutter_app/demo/aec3_room/loop_gain_guard.dart';
 import 'package:my_flutter_app/demo/aec3_room/room_socket.dart';
 import 'package:my_flutter_app/demo/aec3_room/wav_export.dart';
 import 'package:my_flutter_app/demo/util/my_dual_util.dart';
@@ -51,25 +54,33 @@ const String kDefaultRoomId = String.fromEnvironment(
 /// 交给播放引擎，再经过 native 缓冲（targetNativeMs=100）、输出缓冲、扬声器、
 /// 空气、麦克风，之后才会出现在采集流里。**这段延迟两端不一样**：
 ///   - Android（PMA120 实测）：AudioTrack 缓冲大，321~352ms → 补 250
-///   - iOS：AudioUnit 输出缓冲小得多，估 130~160ms → 补 100（未实测，
-///     先保守取小；可用 REF_DELAY_MS 覆盖后重测）
+///   - iOS：AudioUnit 输出缓冲小得多，估 130~160ms → 补 100（**未实测**）
 ///
 /// 推得过满会变成**负延迟**（参考比回声晚到），AEC 无法处理、效果直接归零
-/// —— 两端闭环里只要有一端归零，回声残余 ~0dB，再叠上 iOS 上行 AGC（最高
-/// +24dB），环路增益就会过 1，表现为**双方一停顿就啸叫**。所以宁可欠补
-/// （留正延迟，AEC 自己的延迟估计器能吃），别过补。
+/// —— 两端闭环里只要有一端归零，回声残余 ~0dB，环路增益就会过 1，表现为
+/// 双方一停顿就啸叫。所以宁可欠补（留正延迟给 AEC 自己的延迟估计器）。
+///
+/// 这里的值只是**编译期默认初值**：页面上的「参考补偿」下拉可在运行时改
+/// （100/150/200/250/300），「标定延迟」按钮会播 PN 序列自动测出真机延迟，
+/// 不再靠猜。扫描时两端各跑一次标定即可。
 final int kRefDelayMs = int.fromEnvironment(
   'REF_DELAY_MS',
   defaultValue: Platform.isAndroid ? 250 : 100,
 );
 
-/// 播放增益（百分比）。默认 100 = 不放大。
+/// 播放增益**硬上限 = 100%（不放大）**。
 ///
 /// 送进扬声器的字节同时就是 AEC 的参考信号。原来固定乘 1.6，峰值一过
 /// 20479 就被 clamp 硬削波；削波是不可逆非线性，AEC 的线性滤波器只对得上
-/// 基波，谐波会原样留在成品里（听感 = 还有对方的声音）。
-/// 想更响请调系统媒体音量，**不要**把这个值往 150、200 调。
-const int kPlayGainPct = int.fromEnvironment('PLAY_GAIN_PCT', defaultValue: 100);
+/// 基波，谐波会原样留在成品里。更关键的是：客户端放大直接抬高声学闭环增益，
+/// 真机时间线已证实「音量推到 4 档 → 3 秒后啸叫起振」。
+/// 因此即便 dart-define 传 PLAY_GAIN_PCT=200，这里也钳到 100；
+/// 想更响请调系统媒体音量（那部分由采集侧守卫动态 duck 兜底）。
+const int kMaxPlayGainPct = 100;
+final int kPlayGainPct = math.min(
+  int.fromEnvironment('PLAY_GAIN_PCT', defaultValue: 100),
+  kMaxPlayGainPct,
+);
 
 /// 诊断开关：把 AEC **之前**的原始采集也落一份 `_raw.pcm`，
 /// 重测后可以拿两份文件直接算出真实 ERLE，不用再靠听感判断。
@@ -130,9 +141,25 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   int _aecBytesOut = 0;
   // 高频旁路是否真的生效（由 worker 的 init-over 回报，旧 native 库会为 false）
   bool _highBandBypass = false;
+  // 下行相关门（成品彻底无回声）是否开启
+  bool _residualGate = false;
+
+  // ---------- 采集侧闭环增益守卫 ----------
+  // 喂的是 AEC **之前**的原始采集；duck 系数由播放器在 _doFeed 里读取。
+  final LoopGainGuard _guard = LoopGainGuard();
+  int _lastTriggerCount = 0;
+
+  // ---------- 参考延迟：运行时可调 + 一键标定 ----------
+  int _refDelayMs = kRefDelayMs;
+  static const List<int> kRefDelayOptions = [0, 100, 150, 200, 250, 300];
+  bool _calibActive = false;
+  bool _calibBusy = false;
+  final BytesBuilder _calibCap = BytesBuilder();
+  DateTime? _calibStartAt;
+  DelayEstimate? _calibResult;
 
   // ---------- 参考信号延迟队列 ----------
-  // 播放侧交来的字节先压 kRefDelayMs 再喂 AEC（详见 kRefDelayMs 注释）。
+  // 播放侧交来的字节先压 _refDelayMs 再喂 AEC（详见 kRefDelayMs 注释）。
   // 按 10ms 小块排队，让到达时刻精确到 AEC 自己的帧长，避免整块 100ms
   // 一起到期导致块内对齐误差最大 100ms。
   final List<MapEntry<int, Uint8List>> _refQ = <MapEntry<int, Uint8List>>[];
@@ -171,6 +198,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _uiTimer?.cancel();
+    _calibActive = false;
     _stopRefPump();
     _statusSub?.cancel();
     _textSub?.cancel();
@@ -297,7 +325,8 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       if (message is! Map) return;
       switch (message['type']) {
         case 'opus_packet':
-          if (_socketStatus == RoomSocketStatus.connected) {
+          // 标定期间本端在放 PN 序列，别把它发给对端（对方会听到一段噪声）
+          if (_socketStatus == RoomSocketStatus.connected && !_calibActive) {
             _socket.sendBinaryMessage(message['data']);
           }
           break;
@@ -308,6 +337,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           if (!mounted) return;
           setState(() {
             _highBandBypass = message['highBandBypass'] == true;
+            _residualGate = message['residualGate'] == true;
           });
           break;
         case 'aec_stats':
@@ -345,8 +375,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   void _forwardReference(Uint8List pcm) {
     final port = _workerSendPort;
     if (port == null || _isWorkerClosed || pcm.isEmpty) return;
+    // 标定信号不喂 AEC：它的目的是让回声**原样**留在采集里做互相关，
+    // 一旦被 AEC 消掉，延迟峰就测不出来了。
+    if (_calibActive) return;
 
-    if (kRefDelayMs <= 0) {
+    if (_refDelayMs <= 0) {
       port.send({'type': 'ref_chunk', 'data': pcm});
       return;
     }
@@ -354,7 +387,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     if (!_refClock.isRunning) return;
 
     const int frameBytes = kSampleRateRecorder ~/ 100 * 2; // 10ms 一块
-    final int base = _refClock.elapsedMilliseconds + kRefDelayMs;
+    final int base = _refClock.elapsedMilliseconds + _refDelayMs;
     int lastDue = _refQ.isEmpty ? 0 : _refQ.last.key;
     for (int off = 0; off < pcm.length; off += frameBytes) {
       final int end = math.min(off + frameBytes, pcm.length);
@@ -376,7 +409,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     _refClock
       ..reset()
       ..start();
-    if (kRefDelayMs <= 0) return;
+    if (_refDelayMs <= 0) return;
     _refTimer = Timer.periodic(const Duration(milliseconds: 5), (_) {
       final port = _workerSendPort;
       if (port == null) return;
@@ -412,10 +445,12 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       _aecStarved = 0;
       _aecBytesIn = 0;
       _aecBytesOut = 0;
+      _lastTriggerCount = 0;
       _logs.clear();
     });
+    _guard.reset();
     _log('开始：room=${_roomCtrl.text.trim()} user=$_userId');
-    _log('参考补偿 ${kRefDelayMs}ms（端到端 ~350ms，留 ~100ms 给 AEC 自己估）');
+    _log('参考补偿 $_refDelayMs ms（默认 $kRefDelayMs；页面上可实时改，或点「标定延迟」实测）');
 
     try {
       if (!await _recorder.hasPermission()) {
@@ -449,6 +484,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
         channelCount: kChannels,
         decoder: _decoder,
         baseVolume: kPlayGainPct / 100.0,
+        guard: _guard,
         onPlaybackReference: _forwardReference,
       );
       await _playbackManager!.init();
@@ -526,6 +562,17 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   void _onMicChunk(Uint8List chunk) {
     if (chunk.isEmpty) return;
     if (!_gotMicData) setState(() => _gotMicData = true);
+
+    // 采集侧闭环守卫：必须吃 **AEC 之前**的原始字节。啸叫是声学闭环在
+    // 麦克风侧产生的，AEC 之后已被滤波器污染；上一版挂在下行侧更是看错了信号。
+    _guard.feedCaptureBytes(chunk);
+
+    // 延迟标定：只收开头 3.1s 的原始采集（回声要保留，不能取 AEC 后的成品）
+    if (_calibActive) {
+      final int ms = DateTime.now().difference(_calibStartAt!).inMilliseconds;
+      if (ms <= 3100) _calibCap.add(chunk);
+    }
+
     final port = _workerSendPort;
     if (port == null || _isWorkerClosed) return;
     port.send({
@@ -569,10 +616,15 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
 
   Future<void> _stopAndExport() async {
     if (_phase != _Phase.live) return;
+    if (_calibBusy) {
+      _toast('标定进行中，请等 3 秒完成再结束');
+      return;
+    }
     setState(() => _phase = _Phase.stopping);
     _log('结束中…');
 
     // 1. 先断采集，再关文件：否则关文件之后还会有一两块写进来
+    _calibActive = false;
     await _micSub?.cancel();
     _micSub = null;
     _stopRefPump();
@@ -667,7 +719,8 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           .whereType<File>()
           .where((f) {
             final name = f.uri.pathSegments.last;
-            return name.startsWith('handsfree_') &&
+            return (name.startsWith('handsfree_') ||
+                    name.startsWith('calib_')) &&
                 (name.endsWith('.pcm') || name.endsWith('.wav'));
           })
           .toList()
@@ -789,8 +842,72 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     }
   }
 
+  /// 一键测真机回声延迟（替代靠编译期常量猜 iOS 的 100ms）。
+  ///
+  /// 播放 2s 已知 PN 序列，同时收 3.1s **AEC 前**的原始采集，用 FFT 互相关
+  /// 找峰 —— 峰位置就是「送进播放器 → 扬声器 → 空气 → 麦克风」的端到端延迟。
+  /// 标定期间：不喂 AEC 参考（否则回声被消掉，测不到峰）、不上行（对端不吵）。
+  Future<void> _runCalibration() async {
+    if (_calibBusy) {
+      _toast('标定进行中');
+      return;
+    }
+    if (_phase != _Phase.live) {
+      _toast('先加入房间再标定');
+      return;
+    }
+    setState(() => _calibBusy = true);
+    _log('🔬 标定开始：播放 2s PN 序列，请保持安静、暂时别说话');
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final Uint8List ref = buildCalibSignal();
+      _calibCap.clear();
+      _calibStartAt = DateTime.now();
+      _calibActive = true;
+      await File('${dir.path}/calib_ref.pcm').writeAsBytes(ref);
+
+      // 一次性塞进播放缓冲：_tryFillNativeAnchor 按 100ms 水位逐步喂出，
+      // 参考与采集两条时间轴速率都是 48k，互相关峰不会被展宽。
+      _playbackManager?.handleRawPcm(ref);
+
+      await Future<void>.delayed(const Duration(milliseconds: 3300));
+      _calibActive = false;
+      final Uint8List cap = _calibCap.takeBytes();
+      await File('${dir.path}/calib_cap.pcm').writeAsBytes(cap);
+      _log('🔬 采集 ${(cap.length / 1024).toStringAsFixed(0)}KB，计算互相关…');
+      // 标定这 3 秒 AEC 一直缺参考，重置一下让它重新收敛，别污染后续成品
+      _workerSendPort?.send({'type': 'aec_reset'});
+      final DelayEstimate? est = await estimateDelay(ref, cap);
+      if (!mounted) return;
+      setState(() {
+        _calibResult = est;
+        _calibBusy = false;
+      });
+      if (est == null) {
+        _log('🔬 ❌ 标定失败：采集数据太短');
+      } else if (!est.reliable) {
+        _log('🔬 ⚠️ 置信度低 $est（峰不够尖；环境太吵或系统音量太小）');
+      } else {
+        _log('🔬 ✅ 实测端到端 ${est.lagMs.toStringAsFixed(1)}ms，'
+            '相关 ${est.correlation.toStringAsFixed(3)}，'
+            '建议参考补偿 ${est.suggestedRefDelayMs}ms');
+        _log('   把「参考补偿」调到 ${est.suggestedRefDelayMs}ms 后重录一段验证');
+      }
+    } catch (e) {
+      _calibActive = false;
+      if (mounted) setState(() => _calibBusy = false);
+      _log('🔬 ❌ 标定异常: $e');
+    }
+  }
+
   void _tick() {
     if (!mounted) return;
+    // 守卫触发只在日志里报一次（duck 有 3s + 1s 冷却，一秒轮询足够捕获）
+    if (_guard.triggerCount != _lastTriggerCount) {
+      _lastTriggerCount = _guard.triggerCount;
+      _log('🔥 采集侧守卫触发（${_guard.lastReason}），'
+          '播放增益压到 ${(LoopGainGuard.duckLevel * 100).round()}% 后 3s 恢复');
+    }
     if (_phase == _Phase.live && _workerSendPort != null) {
       _workerSendPort!.send({'type': 'aec_stats'});
     }
@@ -930,7 +1047,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           '成品是 48kHz 全频带（高频旁路已开，可到 20kHz）；对讲上行仍按房间协议'
           '走 16k opus，所以「对方听到的」只有 8kHz 带宽，这是协议限制，不是录音问题。\n'
           '外放音量越大，麦克风拾到的回声越强，AEC 能压掉的比例是固定的 —— '
-          '想听感更干净就把系统音量调小一档。',
+          '想听感更干净就把系统音量调小一档。\n'
+          '采集侧守卫已开：检测到窄带起振或环路增益持续上升，会自动把播放增益'
+          '临时压到 25% 打断啸叫，3 秒后恢复。\n'
+          '首次在某一端跑前，先点「标定延迟」实测这台机器的回声延迟，'
+          '再把「参考补偿」调到建议值；两端各自标定一次。',
           style: TextStyle(color: cs.onSecondaryContainer, height: 1.45),
         ),
       );
@@ -984,6 +1105,75 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
                 ],
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  const Text('参考补偿'),
+                  const SizedBox(width: 12),
+                  DropdownButton<int>(
+                    value: _refDelayMs,
+                    isDense: true,
+                    items: [
+                      for (final v
+                          in ({...kRefDelayOptions, _refDelayMs}.toList()..sort()))
+                        DropdownMenuItem<int>(
+                          value: v,
+                          child: Text(v == 0 ? '0（关）' : '${v}ms'),
+                        ),
+                    ],
+                    onChanged: (int? v) {
+                      if (v == null || v == _refDelayMs) return;
+                      final int old = _refDelayMs;
+                      setState(() => _refDelayMs = v);
+                      _log('⚙️ 参考补偿 $old → ${v}ms'
+                          '${_phase == _Phase.live ? '（对讲中平滑过渡：新值只作用于新入队的块）' : ''}');
+                    },
+                  ),
+                  const Spacer(),
+                  if (_calibResult != null)
+                    Text(
+                      '建议 ${_calibResult!.suggestedRefDelayMs}ms',
+                      style: TextStyle(fontSize: 12, color: cs.primary),
+                    ),
+                ],
+              ),
+              if (_calibResult != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 2),
+                  child: Text(
+                    '实测端到端 ${_calibResult!.lagMs.toStringAsFixed(1)}ms · '
+                    '相关 ${_calibResult!.correlation.toStringAsFixed(3)} · '
+                    '${_calibResult!.reliable ? '结果可用' : '置信度低，仅供试扫'}',
+                    style: const TextStyle(fontSize: 11, color: Colors.grey),
+                  ),
+                ),
+              const SizedBox(height: 8),
+              SizedBox(
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed:
+                      (_phase == _Phase.live && !_calibBusy) ? _runCalibration : null,
+                  icon: _calibBusy
+                      ? const SizedBox(
+                          width: 15,
+                          height: 15,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.graphic_eq, size: 18),
+                  label: Text(
+                    _calibBusy ? '标定中…（3 秒，请保持安静）' : '标定延迟（实测真机回声延迟）',
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ),
+              ),
+              const Padding(
+                padding: EdgeInsets.only(top: 4),
+                child: Text(
+                  '进房后可点：播放 2 秒轻微噪声，这 3 秒不发给对方、不喂 AEC，'
+                  '用互相关算出真实延迟并给出建议补偿值。',
+                  style: TextStyle(fontSize: 11, color: Colors.grey),
+                ),
               ),
             ],
           ),
@@ -1060,13 +1250,44 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
             _row('AEC 帧', _aecFrames == 0 ? '—' : '$_aecFrames（缺参考 $_aecStarved）'),
             _row(
               '参考补偿',
-              '${kRefDelayMs}ms',
-              ok: kRefDelayMs > 0,
+              '$_refDelayMs ms',
+              ok: _refDelayMs > 0,
             ),
             _row(
               '高频旁路',
               _highBandBypass ? '开 · 成品可达 20kHz' : '关 · 旧行为',
               ok: _highBandBypass,
+            ),
+            _row(
+              '残留门',
+              _residualGate ? '开 · 成品彻底无回声' : '关 · 仅 AEC3',
+              ok: _residualGate,
+            ),
+            const Divider(height: 18),
+            _row(
+              '啸叫守卫',
+              _guard.isDucking
+                  ? '压低中 · 已触发 $_lastTriggerCount 次'
+                  : '运行中 · 已触发 $_lastTriggerCount 次',
+              ok: !_guard.isDucking,
+            ),
+            _row(
+              '播放增益',
+              '${(kPlayGainPct * _guard.duckFactor).round()}%'
+                  '${_guard.isDucking ? '（duck）' : ''}',
+            ),
+            _row(
+              '环路增益',
+              _guard.loopGainDb < -60
+                  ? '—'
+                  : '${_guard.loopGainDb.toStringAsFixed(1)} dB',
+            ),
+            _row(
+              '窄带峰',
+              _guard.lastPeakQDb < 0
+                  ? '—'
+                  : '${_guard.lastPeakHz.toStringAsFixed(0)}Hz '
+                      'Q=${_guard.lastPeakQDb.toStringAsFixed(0)}dB',
             ),
             const Divider(height: 18),
             _row('录制时长', _fmt(_elapsed)),
