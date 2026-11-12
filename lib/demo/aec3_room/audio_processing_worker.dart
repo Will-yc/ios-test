@@ -35,6 +35,9 @@ const bool kHighBandBypass =
 /// AEC3 按比例消回声，双讲时会漏掉远端残余 + 厂商音效非线性，成品里仍能
 /// 听到「对方的声音」。开启后，凡「与下行参考高度相关的帧」整帧压低到接近
 /// 静音，代价是双讲（双方同时说）时本端也被压低 —— 成品优先的取舍。
+/// **上行同样过门**（2026-11-12 起）：真机实测网络单向延迟高达 2~3s，
+/// AEC3 追不上，上行不过门时远端声音被原样回传 —— 对端一直听到自己的
+/// 回声，且网络环路对啸叫常开。门用本地播放参考判决，不受网络延迟影响。
 /// 用 `--dart-define=RESIDUAL_GATE=false` 可退回纯 AEC3 行为做对照。
 const bool kResidualGate =
     String.fromEnvironment('RESIDUAL_GATE', defaultValue: 'true') == 'true';
@@ -80,8 +83,9 @@ const bool kUpstreamAgc =
 /// 移植自 `zyxc-record-app/lib/module/chat/audio/my_dual_audio_processing_worker.dart`，
 /// 只保留「验证 AEC3 无耳机」需要的那部分链路：
 ///
-///   mic(48k) → AEC3(48k) ─┬─→ .pcm 落盘（成品，AEC 后的字节）
-///                         └─→ 48k→16k → opus(20ms) → WS 二进制
+///   mic(48k) → AEC3(48k) → 啸叫陷波 → 相关门（上行/成品共用）
+///       ─┬─→ 底噪门 → .pcm 落盘（成品，48k 全频带）
+///        └─→ 底噪门 → 48k→16k → opus(20ms) → WS 二进制
 ///
 /// 原工程的转码/上传/元数据/sidecar 分支全部去掉 —— 本工程只验证外放 AEC。
 void audioProcessingWorker(SendPort mainSendPort) {
@@ -125,8 +129,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
     // 外放回声消除（WebRTC AEC3）。null = 直通（未启用或库不可用）。
     Aec3Processor? aec;
 
-    // 下行相关门（AEC 之后的「宁可错杀」清尾层）。只作用于落盘链路，
-    // 不碰上行 opus。开关 FULLBAND/RESIDUAL_GATE 控制。
+    // 下行相关门（AEC 之后的「宁可错杀」清尾层）。上行与成品共用一份判决：
+    // 成品要干净，上行也不能把 AEC3 没消掉的残余回传给对端（网络单向延迟
+    // 2~3s，残余回传 = 对端听到自己回声 + 啸叫环路常开）。开关 RESIDUAL_GATE。
     ResidualGate? gate;
 
     // 采集侧底噪门（AEC + 陷波 + 相关门之后）。上行一份、成品一份：
@@ -271,21 +276,24 @@ void audioProcessingWorker(SendPort mainSendPort) {
               chunk = notch.process(chunk);
             }
 
-            // 底噪门：只压「明显不像语音」的帧（静音期嗡鸣 / 高频嘶声）。
-            // 放在相关门**之前**取一份给上行用，但**不改动 chunk 本身** ——
-            // 相关门的判决必须基于未被压过的真实能量，否则弱语音会被
-            // 「能量远低于参考」这条兜底判成残余，整句被砍掉。
-            final Uint8List upChunk = (noiseGate != null && chunk.isNotEmpty)
-                ? noiseGate.process(chunk)
-                : chunk;
-
-            // 下行相关门：给落盘成品用的那一份（上行不经过它 ——
-            // 对讲时把对方声音整段压掉会让对讲变成半双工，成品干净就够了）。
-            // 判决基于未被底噪门压过的真实能量；底噪门在相关门**之后**
-            // 作用于成品，顺序与文档一致：AEC→陷波→相关门→底噪门→落盘。
-            Uint8List outChunk = (gate != null && chunk.isNotEmpty)
+            // 下行相关门：一次判决，上行与成品两条路共用。判决基于未被
+            // 底噪门压过的真实能量（否则弱语音会被「能量远低于参考」兜底
+            // 误判成残余，整句被砍）。**上行必须过门**：真机实测网络单向
+            // 延迟 2~3s，AEC3 消不掉的下行残余若不经门直接回传，对端就一直
+            // 听到自己的回声，且网络环路对啸叫常开。门用本地播放参考判决，
+            // 不受网络延迟影响。代价是双讲时上行也被部分压低 —— 延迟已是
+            // 秒级、对话本就轮流说，可接受；成品干净优先。
+            final Uint8List gated = (gate != null && chunk.isNotEmpty)
                 ? gate.process(chunk)
                 : chunk;
+
+            // 底噪门：只压「明显不像语音」的帧（静音期嗡鸣 / 高频嘶声）。
+            // 上行与成品各一个独立实例，互不串状态。
+            // 链路顺序：AEC→陷波→相关门→底噪门→(上行编码 / 落盘)。
+            final Uint8List upChunk = (noiseGate != null && gated.isNotEmpty)
+                ? noiseGate.process(gated)
+                : gated;
+            Uint8List outChunk = gated;
             if (noiseGateOut != null && outChunk.isNotEmpty) {
               outChunk = noiseGateOut.process(outChunk);
             }

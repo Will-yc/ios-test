@@ -19,23 +19,33 @@ import 'dart:typed_data';
 /// 结果缓存；逐帧判决用缓存值。这样 REF_DELAY 猜错多少都不影响门。
 ///
 /// ## 判据（每个 10ms 帧，48kHz = 480 样本）
-/// 1. `rho` = 采集帧与「回退 [currentLagMs] 处的参考」的归一化互相关（取绝对值）。
+/// 1. `rho` = 采集帧与「回退 [currentLagMs] 附近的参考」的归一化互相关（取绝对值）。
+///    实测缓存 lag 会因播放缓冲漂移偏几毫秒，而 10ms 帧的波形相关在 5ms 错位下
+///    就会崩掉，所以每帧在 ±2.5/±5ms 共 5 个偏移上各算一次，取最大 rho。
 /// 2. `rho >= rhoFull` → 本帧几乎全是回声 → 增益压到 [gFloor]。
 /// 3. `rho <= rhoNone` → 纯本端 → 增益 1。
-/// 4. 之间线性过渡（双讲时部分被压，用户已明确接受「成品优先」）。
+/// 4. 之间线性过渡，最深压到 -20dB（双讲时部分被压，用户已明确接受「成品优先」）。
 /// 5. **能量兜底**：下行在响、而本帧电平比参考低 [energyDropDb] 以上 ——
 ///    本端根本没人说话，剩下的只能是残余 → 直接压到 [gFloor]。
 /// 6. **下行静默直通**：参考电平低于 [silentRefDbfs] 时无回声可消 → 增益 1，
 ///    绝不误压本端说话（这条是硬保护）。
+///
+/// ## 阈值来源（2026-11-12 真机成品实测，别再拍脑袋改大）
+/// 用当天录音离线算过：纯回声帧（对端说话、本端静默）的 10ms 波形 rho
+/// 中位数只有 0.36~0.43、p10≈0.09（opus 编解码 + 扬声器非线性 + 房间混响
+/// 会吃掉一大截相关性）；纯本端帧 rho 中位数 ≤0.12。旧阈值 rhoFull=0.40
+/// 正好卡在回声帧分布的中位数上 → 一半回声帧只落到过渡区（旧 midFloor
+/// 只压 -12dB），成品里"对方的声音"就是这么漏出来的。现取
+/// rhoFull=0.28 / rhoNone=0.06：回声帧大头进全压区，本端帧基本不受影响。
 class ResidualGate {
   ResidualGate({
     this.sampleRate = 48000,
     this.frameSamples = 480, // 48kHz 下 10ms
     this.assumedDelayMs = 300,
     this.minDelayMs = 40,
-    this.maxDelayMs = 620,
-    this.rhoFull = 0.40,
-    this.rhoNone = 0.10,
+    this.maxDelayMs = 1200,
+    this.rhoFull = 0.28,
+    this.rhoNone = 0.06,
     this.gFloor = 0.02, // -34dB
     this.smooth = 0.6,
     this.energyDropDb = 14.0,
@@ -74,13 +84,15 @@ class ResidualGate {
   /// 粗搜探针块数（50 × 4ms = 200ms）。太短会被音节起伏带偏，太长跟不上延迟漂移。
   static const int envProbeBlocks = 50;
 
-  /// **冷启动**用的探针块数（150 × 4ms = 600ms）。
+  /// **冷启动**用的探针块数（250 × 4ms = 1000ms）。
   ///
   /// 冷启动没有「上一帧 lag」可做先验，而任何起伏性信号（语音的音节、调幅）
   /// 都会在等价延迟处给出同样高的包络相关 —— 实测 500ms 会被 166ms 抢走，
   /// 两者刚好差一个 322ms 的起伏周期。探针必须长过起伏周期才能唯一确定。
   /// 一旦锁定，后续用 200ms 短探针快速跟随漂移即可。
-  static const int envColdProbeBlocks = 150;
+  /// 150→250：搜索窗口放宽到 1200ms 后等价峰更多，探针同步加长；
+  /// 最终判峰靠波形复筛，包络只负责缩小候选。
+  static const int envColdProbeBlocks = 250;
 
   /// 「留在原位」先验的惩罚系数（每偏离 1 秒扣多少相关分）。
   /// 0.15 意味着：等价峰要高出 0.15 才值得移动 1 秒；实测的假峰间隔是
@@ -88,17 +100,30 @@ class ResidualGate {
   static const double lagPriorPenalty = 0.15;
 
   /// 包络粗筛后保留几个候选交给波形复筛。
-  /// 3 个足够：真峰 + 最多两个"差整数个音节周期"的等价峰。
-  static const int candTopK = 3;
+  /// 4 个：真峰 + 最多三个"差整数个音节周期"的等价峰（窗口放宽到 1200ms
+  /// 后等价峰变多，最终判峰靠波形分数，多带一个候选成本可忽略）。
+  static const int candTopK = 4;
+
+  /// 波形复筛的接受门槛：低于它视为「没找到可信对齐」，保持原状。
+  /// 实测真对齐处 40ms 波形分 0.3~0.6，等价峰/噪声峰一般 <0.15；
+  /// 旧门槛 0.05 太松 —— 离线仿真里 lag 每 100ms 乱跳（300→468→788→49），
+  /// 判决永远打在错位上，回声段只压了 10dB。
+  static const double fineAccept = 0.20;
+
+  /// 已锁定时的切换滞回：新峰波形分至少高出原位这么多才允许搬家，
+  /// 防止搜索被语音起伏的等价峰牵着走。
+  static const double fineHyst = 0.08;
 
   int get _minLag => minDelayMs * sampleRate ~/ 1000;
   int get _maxLag => maxDelayMs * sampleRate ~/ 1000;
 
-  final _Ring _cap = _Ring(48000); // 采集留 1s（冷启动探针 600ms 够用）
+  final _Ring _cap = _Ring(96000); // 采集留 2s（冷启动探针 1000ms 够用）
 
-  /// 参考留 2s：冷启动要用 600ms 探针，加上最长 620ms 的延迟，合计 1220ms，
-  /// 1s 的环不够（会一直返回 false，门永远等不到第一个 lag）。
-  final _Ring _refKeep = _Ring(96000);
+  /// 参考留 3s：冷启动要用 1000ms 探针，加上最长 1200ms 的延迟，合计 2200ms，
+  /// 2s 的环不够（会一直返回 false，门永远等不到第一个 lag）。
+  /// 搜索门槛已放宽为「_minLag + 探针」：历史不足 maxLag 时只在可用范围内搜，
+  /// 不用等环攒满，开局 1 秒左右就能锁定。
+  final _Ring _refKeep = _Ring(144000);
 
   int _lag = -1;
   int _sinceSearch = 0;
@@ -151,10 +176,13 @@ class ResidualGate {
     final double capRms = math.sqrt(sumSq / n);
     _lastCapDbfs = 20 * _log10(capRms / 32768.0 + 1e-12);
 
-    // 帧近乎静音：什么都不用做（也算"直通"，别把增益平滑状态搅乱）
+    // 帧近乎静音：什么都不用做（也算"直通"，别把增益平滑状态搅乱）。
+    // 注意：**绝不能在这里把 _lag 赋成假设值** —— 一旦 _lag >= 0，冷启动
+    // 逻辑（长探针 + 无先验）就永久失效，之后一直用短探针在错误先验附近
+    // 打转（离线仿真实测：lag 轨迹 300→468→788→49 乱跳，永远锁不住）。
+    // 判决路径另有 _effectiveLag 兜底，不需要提前赋值。
     if (capRms < 2.0) {
       _lastRho = 0;
-      if (_lag < 0) _lag = _initialLag;
       _prevGain += (1.0 - _prevGain) * (smooth * 0.5);
       return frame;
     }
@@ -169,7 +197,16 @@ class ResidualGate {
 
     double g = 1.0;
     final Float64List refWin = Float64List(n);
-    if (_windowBeforeEnd(_refKeep, _effectiveLag, n, refWin)) {
+    // 抖动容差：缓存 lag 来自每 100ms 一次的搜索，播放缓冲漂移/hardSync
+    // 会让真实延迟偏出几个毫秒，而 10ms 帧的波形相关在 5ms 错位下就近乎归零
+    // —— 门会"看起来锁定却压不动"。在 ±2.5/±5ms 五个偏移上各算一次取最大。
+    double bestRho = 0;
+    double bestERef = 0;
+    bool anyRef = false;
+    for (final int off in const <int>[-240, -120, 0, 120, 240]) {
+      final int lagTry = _effectiveLag + off;
+      if (lagTry < 0) continue;
+      if (!_windowBeforeEnd(_refKeep, lagTry, n, refWin)) continue;
       double eRef = 0;
       double cross = 0;
       for (int i = 0; i < n; i++) {
@@ -177,7 +214,16 @@ class ResidualGate {
         eRef += r * r;
         cross += pcm[i] * r;
       }
-      final double refRms = math.sqrt(eRef / n);
+      final double rho =
+          (cross / (math.sqrt(eRef) * math.sqrt(sumSq) + 1e-9)).abs();
+      if (!anyRef || rho > bestRho) {
+        anyRef = true;
+        bestRho = rho;
+        bestERef = eRef;
+      }
+    }
+    if (anyRef) {
+      final double refRms = math.sqrt(bestERef / n);
       _lastRefDbfs = 20 * _log10(refRms / 32768.0 + 1e-12);
 
       if (refRms < 1.0) {
@@ -185,8 +231,7 @@ class ResidualGate {
         g = 1.0;
         _lastRho = 0;
       } else {
-        final double rho =
-            (cross / (math.sqrt(eRef) * math.sqrt(sumSq) + 1e-9)).abs();
+        final double rho = bestRho;
         _lastRho = rho.clamp(0.0, 1.0);
 
         if (rho >= rhoFull) {
@@ -195,8 +240,9 @@ class ResidualGate {
           g = 1.0;
         } else {
           final double t = (rho - rhoNone) / (rhoFull - rhoNone);
-          // 过渡区最多压到 -12dB（双讲时保护本端，仍能削掉一部分对方声音）
-          const double midFloor = 0.25;
+          // 过渡区最深压到 -20dB：实测回声帧 rho 分布宽（p10≈0.09~p90≈0.7），
+          // 旧 midFloor=0.25(-12dB) 时过渡区漏出的对方声音仍清晰可辨。
+          const double midFloor = 0.10;
           g = midFloor + (1.0 - midFloor) * (1.0 - t);
         }
 
@@ -243,9 +289,12 @@ class ResidualGate {
     final int probeSamples = block * probeBlocks;
 
     if (_cap.length < probeSamples) return;
-    if (_refKeep.length < _maxLag + probeSamples) return;
+    // 门槛放宽为「最小 lag + 探针」：历史不足 maxLag 时只在可用范围里搜
+    // （循环对 start<0 的 lag 直接跳过），开局 ~1s 就能拿到第一个 lag，
+    // 不必等参考环攒满 maxLag+探针 才开始工作。
+    if (_refKeep.length < _minLag + probeSamples) return;
 
-    final int refSamples = _maxLag + probeSamples;
+    final int refSamples = math.min(_maxLag + probeSamples, _refKeep.length);
     final int refBlocks = refSamples ~/ block;
     final Float64List capEnv = Float64List(probeBlocks);
     final Float64List refEnv = Float64List(refBlocks);
@@ -302,16 +351,27 @@ class ResidualGate {
     }
     if (capSq < 1.0) return;
 
-    int lagBest = -1;
-    double bestFine = 0;
+    // ---- pass1：40ms 短探针快筛（每个候选基找局部最优）----
     final Float64List refWin = Float64List(fineProbe);
     final int topK = math.min(candTopK, order.length);
+    final List<int> bases = <int>[
+      for (int t = 0; t < topK; t++) cands[order[t]] * block,
+    ];
+    // 当前 lag 永远参与复筛：包络分被等价峰抢走时，只要原位波形
+    // 仍然好，滞回就会把 lag 按在原处，不会被语音起伏牵着乱跳。
+    if (_lag >= 0) {
+      final int curBase = (_lag ~/ block) * block;
+      if (!bases.any((b) => (b - curBase).abs() <= 2 * block)) {
+        bases.add(curBase);
+      }
+    }
+    final List<List<double>> p1 = <List<double>>[]; // [localBest, bestCand]
     final List<String> dbg = <String>[];
-    for (int t = 0; t < topK; t++) {
-      final int base = cands[order[t]] * block;
+    for (final int base in bases) {
       final int lo = math.max(0, base - 2 * block);
       final int hi = base + 2 * block;
       double localBest = 0;
+      int bestCand = lo;
       for (int cand = lo; cand <= hi; cand += 4) {
         if (!_windowBeforeEnd(_refKeep, cand, fineProbe, refWin)) continue;
         double eRef = 0;
@@ -323,23 +383,90 @@ class ResidualGate {
         }
         if (eRef < 1.0) continue;
         final double r = (cross / (math.sqrt(eRef * capSq) + 1e-9)).abs();
-        if (r > localBest) localBest = r;
+        if (r > localBest) {
+          localBest = r;
+          bestCand = cand;
+        }
+      }
+      p1.add(<double>[localBest, bestCand.toDouble()]);
+      dbg.add('${base * 1000 ~/ sampleRate}ms(w=${localBest.toStringAsFixed(3)})');
+    }
+
+    // ---- pass2：200ms 长探针复核 ----
+    // 40ms 探针只有一个音节：近端语音主导时所有基都分低，而随机峰也能到
+    // 0.2~0.3 —— 离线仿真实测旧逻辑跟着随机峰搬家，lag 全程乱跳锁不住。
+    // 200ms 探针把随机相关压到 ~0.05，真对齐处维持 0.3~0.5，判别才可靠。
+    const int longProbe = 9600;
+    final Float64List capL = Float64List(longProbe);
+    if (!_windowBeforeEnd(_cap, 0, longProbe, capL)) return;
+    double capLSq = 0;
+    for (int i = 0; i < longProbe; i++) {
+      capLSq += capL[i] * capL[i];
+    }
+    // 采集端这 200ms 太安静（rms<60 ≈ -54dBFS）：搜索没有信息量，保持原状
+    if (capLSq / longProbe < 3600) return;
+
+    final Float64List refL = Float64List(longProbe);
+    p1.sort((a, b) => b[0].compareTo(a[0]));
+    int lagBest = -1;
+    double bestFine = 0;
+    final int p2n = math.min(3, p1.length);
+    for (int t = 0; t < p2n; t++) {
+      final int c0 = p1[t][1].toInt();
+      for (int cand = c0 - 192; cand <= c0 + 192; cand += 16) {
+        if (cand < 0) continue;
+        final double r = _longScore(cand, capL, capLSq, refL);
         if (r > bestFine) {
           bestFine = r;
           lagBest = cand;
         }
       }
-      dbg.add('${base * 1000 ~/ sampleRate}ms(env=${candScores[order[t]].toStringAsFixed(3)},'
-          'wave=${localBest.toStringAsFixed(3)})');
+    }
+    // 当前锁定位的长探针分（滞回基准）
+    double curFine = 0;
+    if (_lag >= 0) {
+      for (int cand = _lag - 192; cand <= _lag + 192; cand += 16) {
+        if (cand < 0) continue;
+        final double r = _longScore(cand, capL, capLSq, refL);
+        if (r > curFine) curFine = r;
+      }
     }
     if (debug) {
       // 离线验证专用（worker 里 debug 恒为 false，不会打印）
       // ignore: avoid_print
-      print('[gate] 冷启动=${_lag < 0} topK=${dbg.join(" ")} → '
+      print('[gate] 冷启动=${_lag < 0} p1=${dbg.join(" ")} → '
           'pick=${lagBest < 0 ? -1 : lagBest * 1000 ~/ sampleRate}ms '
-          'wave=${bestFine.toStringAsFixed(3)}');
+          'long=${bestFine.toStringAsFixed(3)} cur=${curFine.toStringAsFixed(3)}');
     }
-    if (lagBest >= 0 && bestFine >= 0.05) _lag = lagBest;
+    // 接受门槛 + 滞回（长探针分数）：低于 fineAccept 视为「没找到可信对齐」，
+    // 保持原状；已锁定时新峰要高出原位 fineHyst 才准搬家。
+    if (lagBest >= 0 && bestFine >= fineAccept) {
+      if (_lag < 0) {
+        _lag = lagBest;
+      } else if ((lagBest - _lag).abs() <= 2 * block ||
+          bestFine >= curFine + fineHyst) {
+        _lag = lagBest;
+      }
+    }
+  }
+
+  /// 长探针复核用的波形归一化相关；参考窗太安静（无信息）时返回 0。
+  double _longScore(
+    int cand,
+    Float64List capL,
+    double capLSq,
+    Float64List refL,
+  ) {
+    if (!_windowBeforeEnd(_refKeep, cand, capL.length, refL)) return 0;
+    double eRef = 0;
+    double cross = 0;
+    for (int i = 0; i < capL.length; i++) {
+      final double r = refL[i];
+      eRef += r * r;
+      cross += capL[i] * r;
+    }
+    if (eRef / capL.length < 3600) return 0;
+    return (cross / (math.sqrt(eRef * capLSq) + 1e-9)).abs();
   }
 
   /// 从 [ring] 末尾往前取 [blocks] 块、每块 [block] 样本的 RMS 包络。

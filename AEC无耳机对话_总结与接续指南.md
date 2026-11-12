@@ -345,3 +345,66 @@ adb exec-out run-as com.example.my_flutter_app cat app_flutter/<文件名> > <�
 2. iOS 不应再听到自己的回声（Android 上行已重新经 AEC3 消回声）。若仍有，先确认
    Android 状态卡残留门「对齐 xxx ms」是否正常，再考虑 `SYS_3A=false` 关 iOS VPIO A/B。
 3. 啸叫：两端对话 30s+ 不应再金属尖叫；守卫「已触发 N 次」与陷波锁频仍应 5s 内生效。
+
+## 十五、第十五轮：iOS 音质回退裸麦 + 相关门按实测重调 + 门接上行（2026-11-12 晚）
+
+### 用户反馈
+iOS 仍能明确听到自己的回声；Android 成品录到两个人的声音；iOS 成品频谱不到
+16kHz（应 20kHz）、底噪"太干净"不自然。用户点名 bd2c408 之前的 iOS 音质是好的。
+
+### 根因（全部有离线数据支撑，成品在 ~/Downloads/audio/test 18:27 那组）
+1. **iOS 音质** = bd2c408 引入的 VPIO（voiceChat + echoCancel/NS/AGC）：
+   成品大段 -240dBFS 数字零底噪、带宽被限；且播放走 FlutterPcmSound 自己的
+   AudioUnit，VPIO 的 AEC 根本参考不到这条渲染流——音质毁了，回声也没消掉。
+2. **Android 成品双人声** = 相关门阈值卡错：用当天录音实测，纯回声帧的 10ms
+   波形 rho 中位数只有 0.36~0.43（opus+扬声器非线性+混响吃掉相关性），
+   rhoFull=0.40 正好卡在分布中位数上 → 一半回声帧只落到过渡区（-12dB），
+   对方声音清晰可辨。离线对比成品/raw：门确实间歇生效（个别段 -18~-34dB）。
+3. **iOS 听到自己回声** = 门只接在成品链路，上行不过门：AEC3 消不掉的残余
+   被原样回传。另实测**网络单向延迟高达 2~3.6s**（iOS 语音 3.03s 后才出现在
+   Android 采集里，往返 ~7.6s）——这是服务端问题，任何按小延迟设计的 AEC
+   （包括 TRTC 引擎，其前提是单向 <400ms）都追不上；但相关门用**本地播放
+   参考**判决，不受网络延迟影响，是唯一可行的 app 侧手段。
+4. **门锁不稳的次生 bug（离线仿真暴露）**：a) 静音帧捷径把 `_lag` 提前赋成
+   假设值 300，永久废掉冷启动长探针（代码注释里自己警告过的坑）；b) 40ms
+   短探针在近端主导时随机峰也能过 0.05 门槛，lag 每 100ms 乱跳（仿真轨迹
+   300→468→788→49…）。
+
+### 改动
+- `handsfree_room_page.dart`：`kSys3A` 默认 **false**（iOS 回裸麦 48k，成品恢复
+  20kHz 全频带+自然噪底；VPIO 仅 `--dart-define=SYS_3A=true` 做 A/B）。
+  状态卡「系统3A上行」默认显示「关 · 裸麦48k→AEC3+相关门 上行」且判 ok。
+- `residual_gate.dart`：
+  - 阈值按实测重调：rhoFull 0.40→**0.28**、rhoNone 0.10→**0.06**、过渡区
+    midFloor 0.25→**0.10**（-20dB）；maxDelayMs 620→1200（覆盖播放缓冲漂移）。
+  - 删掉静音帧对 `_lag` 的提前赋值（冷启动长探针不再被废）。
+  - 搜索改两遍：40ms 短探针快筛候选 → **200ms 长探针复核**（随机相关 ~0.05，
+    真对齐 0.3~0.5），接受门槛 fineAccept=0.20 + 切换滞回 fineHyst=0.08，
+    当前锁定位永远参与复核。冷探针 600→1000ms，环 2s/3s，topK 3→4，
+    搜索门槛放宽为 minLag+探针（开局 ~1s 即可锁定）。
+  - 判决加 ±2.5/±5ms 五个偏移取最大 rho（缓冲漂移容差）。
+- `audio_processing_worker.dart`：**上行与成品共用门的判决**（一次 process，
+  两条链路各过独立底噪门）。上行过门 = 远端残余不再回传 → iOS 不再听到自己，
+  且网络环路对啸叫常闭。代价：双讲时上行被部分压低（网络延迟已是秒级、
+  对话本就轮流说，成品干净优先）。
+- 新增 `tool/gate_offline.dart`：用真机 raw + 对端成品离线回放门的判决路径
+  （`dart run tool/gate_offline.dart <capture.pcm> <farend.wav> [echo_lag] [ref_lead]`）。
+
+### 离线验证（真机 18:27 数据）
+- 纯回声段压制 **25.9dB / 11.2~25.9dB**（修复前同数据 10.6dB，线上听感漏声）；
+  纯本端段 **0.0dB**（硬保护完好）；混合段 4.0dB（双讲轻压，符合取舍）。
+- `dart analyze lib/demo/aec3_room/ tool/`：新增/改动文件 0 issue。
+
+### 出包 / 装机
+- Android：`flutter build apk --debug --dart-define=ROOM_TEST=true
+  --dart-define=ROOM_ID=aec3test --dart-define=KEEP_RAW=true`，adb 重装。
+- iOS：触发 `.github/workflows/ios-release.yml`（workflow_dispatch）出新 IPA 重装
+  ——本轮 iOS 行为变化大（VPIO 关），必须重装。
+
+### 真机复测要点（本轮）
+1. iOS 成品：频谱应回到 ~20kHz、底噪自然（不再有 -240dBFS 数字零段）。
+2. Android 成品：对端说话、本端静默的段落应接近静音（≥20dB 压制）；
+   状态卡「残留门」应显示「对齐 xx ms（ρ=…）」且 ρ 随对端说话上升。
+3. iOS 不再听到自己的回声（Android 上行已过门）；双讲时上行会被压，属预期。
+4. 服务端单向延迟 2~3.6s 明显异常（TRTC 同级场景 <400ms），建议查
+   appapi.zhiyuexc.com/audiowss 的混音/转发缓冲——这不修，对话体验始终差。

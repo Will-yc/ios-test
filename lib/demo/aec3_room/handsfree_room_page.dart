@@ -84,26 +84,21 @@ final int kPlayGainPct = math.min(
   kMaxPlayGainPct,
 );
 
-/// 系统 3A 开关（参考 TRTC：通话一律走系统 AEC/NS/AGC，而不是裸麦）。
+/// 系统 3A 开关（VPIO / VOICE_COMMUNICATION 通话档）。**默认关**。
 ///
-/// 第四版真机实测证明：我们自己的 AEC3 在「网络环路啸叫」面前 ERLE≈0 ——
-/// 环路一圈 ~1.1s，远超 AEC3 的延迟跟踪能力，滤波器根本收敛不上。
-/// TRTC 之所以不啸叫，是因为它的上行**永远**经过系统 3A：
-///   - Android：VOICE_COMMUNICATION 采集源 + AcousticEchoCanceler/
-///     NoiseSuppressor/AGC 效果，系统 AEC 用的是 HAL 里真实的播放参考，
-///     不需要我们猜 REF_DELAY，收敛快、尾长覆盖好；
-///   - iOS：VPIO（setVoiceProcessingEnabled，即 voiceChat 档），同一套东西。
-/// 系统 AEC 把「本端扬声器→本端麦」这一跳的回声压得更干净，回传给对端的
-/// 残余更小，整个网络环路的增益就被压到 1 以下。
-///
-/// 实现上分平台：
-///   - Android：**默认单流**。成品与上行共用一条裸麦 48k 流（保 20kHz 音质，
-///     已验收），上行经我们自己的 AEC3。网络环路啸叫由「投票检测 + 双侧陷波
-///     + 70% 音量」压增益来治（系统 AEC 追不上 ~1.1s 的网络环路）。
-///   - iOS：系统不允许两条采集流，单流开 VPIO（echoCancel=true）。
-///     我们的 AEC3/门链保留作第二层。--dart-define=SYS_3A=false 可回退 A/B。
+/// 曾参考 TRTC「通话一律走系统 3A」把 iOS 切成 voiceChat+VPIO（bd2c408），
+/// 2026-11-12 真机成品实测证明这条路对本项目是双输：
+///   1. **音质被毁**：VPIO 把采集限到语音带宽（成品频谱 <16kHz，应 20kHz），
+///      NS 把静音段压成纯数字零（成品大段 -240dBFS，底噪"太干净"不自然），
+///      而本项目成品是方言语料，要的就是全频带 + 真实噪底。
+///   2. **回声照旧**：播放走 FlutterPcmSound 自己的 AudioUnit，VPIO 的 AEC
+///      参考不到这条渲染流，实测 iOS 成品里对方声音照样在；且真机网络
+///      单向延迟 2~3s，任何按「小延迟」设计的系统 AEC 都追不上。
+/// 现在两端统一：裸麦 48k → worker AEC3 + 相关门（门用本地播放参考自搜
+/// 延迟，天然不受网络延迟影响），上行与成品共用门的判决。
+/// 仅做 A/B 对照时用 --dart-define=SYS_3A=true 打开。
 const bool kSys3A =
-    String.fromEnvironment('SYS_3A', defaultValue: 'true') == 'true';
+    String.fromEnvironment('SYS_3A', defaultValue: 'false') == 'true';
 
 /// Android「双流」开关，**默认关**。2026-11-12 真机回归实测（PMA120）：
 /// 第二条 VOICE_COMMUNICATION 采集流一启动就把第一条裸麦成品流抢占停摆
@@ -692,10 +687,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
               audioSession: _audioSession,
             )
           : null;
-      // iOS 只允许一条采集流：SYS_3A 开启时直接在这条流上启用 VPIO
-      // （record 插件把 echoCancel=true 映射成 inputNode.setVoiceProcessingEnabled，
-      // 即 TRTC voiceChat 档的系统 AEC+NS；autoGain 映射 VPIO AGC）。
-      // Android 这条流保持裸麦（成品要 20kHz 带宽），系统 3A 走第二条上行流。
+      // iOS 只允许一条采集流：默认裸麦（成品要 20kHz 带宽 + 自然噪底）。
+      // 仅显式 SYS_3A=true 时才在这条流上启用 VPIO 做 A/B 对照 ——
+      // record 插件把 echoCancel=true 映射成 inputNode.setVoiceProcessingEnabled。
+      // 真机实测 VPIO 双输：成品带宽被限到 <16kHz、静音段压成数字零，
+      // 且它的 AEC 参考不到 FlutterPcmSound 的渲染流，回声照样漏进成品。
       final bool ios3A = kSys3A && Platform.isIOS;
       final stream = await _recorder.startStream(
         RecordConfig(
@@ -1616,15 +1612,19 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
             _row(
               '系统3A上行',
               !kSys3A
-                  ? '关 · 纯 AEC3 上行'
+                  ? '关 · 裸麦48k→AEC3+相关门 上行'
                   : Platform.isIOS
-                      ? '开 · iOS VPIO 单流'
+                      ? '开 · iOS VPIO 单流（成品会被限带宽）'
                       : (kAndroidDualStream
                           ? (_sysUplinkActive
                               ? '开 · VOICE_COMM 双流'
                               : '回退 · worker 上行')
                           : '单流 · 裸麦48k→AEC3 上行'),
-              ok: kSys3A && (Platform.isIOS || !kAndroidDualStream || _sysUplinkActive),
+              // 默认（SYS_3A=false）裸麦链路就是正确状态 → ok
+              ok: !kSys3A ||
+                  Platform.isIOS ||
+                  !kAndroidDualStream ||
+                  _sysUplinkActive,
             ),
             _row(
               '上行 AGC',
