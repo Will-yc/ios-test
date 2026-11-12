@@ -300,3 +300,48 @@ adb exec-out run-as com.example.my_flutter_app cat app_flutter/<文件名> > <�
 3. iOS 成品带宽：VPIO 可能收窄高频，属预期取舍（TRTC 通话档同样）；要保 iOS 全频带可
    `SYS_3A=false` 出包 A/B，但啸叫抑制会弱。
 4. Android 成品仍应 20kHz 全频带（双流设计，裸麦链没动）。
+
+## 十四、2026-11-12 第四轮：SYS_3A 双流回归 —— Android 成品空 / iOS 听到自己回声
+
+### 现象（装机后真机录音）
+- `handsfree_A_…_android.wav` 只有 0.08s、−77.8dBFS，几乎全空。
+- iOS 端「一直听到自己的回声」。
+
+### 根因（同一处改动：Android 双流）
+1. **Android 成品空**：SYS_3A 在 Android 开的第二条 `VOICE_COMMUNICATION` 采集流，
+   在 PMA120 上把第一条裸麦成品流**抢占停摆**。设备上 `成品.pcm` 与 `_raw.pcm`
+   都只有 7680B（80ms）——`_raw` 是 worker 直接落 AEC 前采集，证明是**麦克风流本身**
+   在第二流启动后断供，不是处理链问题。record 插件虽按实例隔离，但系统层并发采集
+   会抢占（VOICE_COMMUNICATION 优先级高于裸 MIC）。
+2. **iOS 听到自己回声**：成品流死了，但第二条上行流还活着往 iOS 送声；它挂在
+   `modeNormal` 下，而 Android `AcousticEchoCanceler` 必须 `MODE_IN_COMMUNICATION`
+   才生效 → 这条流的系统 AEC 实际没工作，把 iOS 的话经 Android 扬声器→麦原样送回，
+   形成网络环路，iOS 听到自己的回声。**系统 AEC 本就追不上 ~1.1s 的网络环路**，
+   治环路靠的是压增益（投票检测+双侧陷波+70%音量），不是系统 3A。
+
+### 修复
+- 新增 `kAndroidDualStream`（`--dart-define=SYS_3A_DUAL`，**默认 false**）：Android
+  回到**单流**——裸麦 48k 一条流喂成品 + worker AEC3 上行（音质已验收的通路）。
+  第二条流代码保留，仅在确认可并发采集的机型上显式打开做 A/B。
+- **iOS 不变**（仍 VPIO 单流，无并发冲突）；iOS 回声是「经 Android 的网络环路」，
+  Android 上行恢复 AEC3 后即断环，故 iOS 无需重新出包。
+- 上一轮压环路增益的改进**全部保留**：投票检测、双侧陷波、70% 音量、成品底噪门。
+
+### 验证
+- `dart analyze lib/demo/aec3_room/` 全绿；`_sysUplinkActive` 仅在 `_startSysUplink`
+  置真，而后者已被 `kAndroidDualStream`（默认关）挡住 → Android 默认走 worker 上行。
+- **真机自证（adb 驱动进房开录）**：状态卡「系统3A上行」=「单流 · 裸麦48k→AEC3 上行」；
+  录制持续 58s 不断流，导出 wav 58.1s / RMS −35.6dBFS / peak 0.893，>16kHz 能量非零
+  （全频带通路完好）。对照修复前同机只有 0.08s / −77.8dBFS 空文件。
+
+### 出包 / 装机
+- Android：`flutter build apk --debug --dart-define=ROOM_TEST=true
+  --dart-define=ROOM_ID=aec3test --dart-define=KEEP_RAW=true`，adb 重装。
+- iOS：沿用已装 IPA（VPIO 开），本轮未改 iOS 音频行为，不出新包。
+
+### 真机复测要点（本轮）
+1. Android 状态卡「系统3A上行」应显示「**单流 · 裸麦48k→AEC3 上行**」；成品 wav 应
+   正常有声、20kHz 全频带（不再是 0.08s 空文件）。
+2. iOS 不应再听到自己的回声（Android 上行已重新经 AEC3 消回声）。若仍有，先确认
+   Android 状态卡残留门「对齐 xxx ms」是否正常，再考虑 `SYS_3A=false` 关 iOS VPIO A/B。
+3. 啸叫：两端对话 30s+ 不应再金属尖叫；守卫「已触发 N 次」与陷波锁频仍应 5s 内生效。
