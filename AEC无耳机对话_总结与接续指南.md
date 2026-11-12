@@ -240,3 +240,63 @@ adb exec-out run-as com.example.my_flutter_app cat app_flutter/<文件名> > <�
 2. 单讲（只有对方说）：成品应几乎彻底安静（先前残余约 −32dBFS，现在目标 < −60）。
 3. 静音期：底噪门应显示噪底 −60~−70dBFS 区间；成品里不应再有 120Hz 嗡鸣与高频嘶声。
 4. 啸叫：状态卡「啸叫陷波」不应再出现 1.2kHz 以下的频点。
+
+## 十三、2026-11-12 第三轮：参考 TRTC 通话档，压「网络环路啸叫」
+
+用户反馈：仍有噪音、对话很不稳定、随时突然啸叫（两台设备**不在同一空间**）。
+指定参考 `download/TRTC_Flutter-master/`，「有合理适用的直接参考调整」。
+
+### 根因升级：这不是本地啸叫，是**网络声学环路**
+- 环路：A 麦→上行→B 外放→B 麦→上行→A 外放→A 麦。分房间**断不开**这个环。
+- 一圈往返 ~1.1s，远超 AEC3 的延迟跟踪能力 → 啸叫期 AEC3 的 ERLE≈0（raw vs 成品实测）。
+  我们之前所有「本地 AEC/陷波」都在跟一个**不在本地**的环路较劲。
+- 环路增益 >1 就自激。要熄振，必须把**每一跳的残余**压下去、把环路增益压到 1 以下。
+
+### TRTC 的可借鉴结论（Explore 逐文件核对）
+1. **通话一律 speech 档 + 系统 3A**：Android `VOICE_COMMUNICATION`、iOS `voiceChat`(VPIO)。
+   系统 AEC 用 **HAL 里真实的播放参考**，不用猜 REF_DELAY，收敛快、尾长覆盖好。
+   （`ITXDeviceManager.h`、`trtc_cloud.dart` startLocalAudio、`audio_call_state.dart`）
+2. **先 AEC、再分叉**：`onCapturedAudioFrame` 拿到的已是 ANS/AEC/AGC 处理后的帧。
+3. **播放音量默认 50，从不拉满**（`audio_quality_state.dart`）；媒体音量全频带只用于
+   耳机/录音场景，**不用于外放对讲**。
+4. 自定义采集会破坏 AEC；啸叫有专门告警码 7002。
+
+### 本轮改动（commit bd2c408）
+1. **系统 3A 上行 `SYS_3A`（默认开，`--dart-define=SYS_3A=false` 可回退 A/B）**：
+   - **Android 双流**：成品链**保持裸麦 48k + 我们的 AEC3**（保住已验收的 20kHz 音质）；
+     另开一条 **16k `VOICE_COMMUNICATION` + AEC/NS/AGC** 流，系统处理后**直接编码上行**。
+     不动 AudioManager 全局模式（保持 modeNormal，避免把裸麦流/播放带偏）。
+     **回退**：该流启动失败 / 连续 3s 全数字零 / 3s 无数据 → 自动切回 worker 上行（无断档）。
+   - **iOS 单流**：系统不允许两条采集流，直接在这条流开 **VPIO**（record 插件把
+     `echoCancel=true` 映射成 `setVoiceProcessingEnabled`），会话模式 `voiceChat`。
+     代价：iOS 采集带宽可能被压到语音档（TRTC 通话同样如此）；我们的 AEC3/门链保留作第二层。
+2. **播放增益默认 100%→70%**（TRTC 用 50）：环路增益与播放音量成正比，直接 −3dB 余量。
+3. **啸叫检测改投票式**（`LoopGainGuard`）：最近 500ms 窄带峰投票占比判啸叫，容忍间歇
+   bursts 与跳频。真机第四版 raw 离线回放：**首锁 25.8s→5.0s**，0-4s 纯语音**零误报**；
+   投票≥0.2 时**持续 duck**（不再 3s 固定恢复后复燃），安静段才回升。
+4. **陷波双侧**：锁定频点同时下发**采集侧 + 播放侧**两个陷波器（`_playNotch` 挂在
+   `_doFeed`，先于 duck/参考取出，AEC 参考仍=扬声器字节）。环路一圈各挖 22dB=44dB。
+   带宽 160→240Hz，跟得上跳频。
+5. **修成品绕过底噪门的旁路**：落盘链路补第二个 `NoiseGate` 实例（旧版只接了上行，
+   成品静音期只压 1.7dB，应 ~19dB）。
+6. 相关门阈值 `rhoFull 0.50→0.40 / rhoNone 0.16→0.10`。
+
+### 验证（离线，全部通过）
+- `dart analyze lib/demo/aec3_room/` 全绿。
+- `verify_v4_chain.dart`（已改投票式）：真机 raw 回放，0-4s 语音 vote≤0.04 无锁无触发；
+  5.0s 啸叫起振即锁 2016Hz 并 duck；投票持续期 duck 钉在 0.25，安静段回升、复燃再触发。
+- `verify_notch / verify_noisegate / verify_gate` 回归全过（240Hz 带宽、新 rho 阈值下）。
+
+### 出包 / 装机
+- Android：本机 `flutter build apk --debug`（+`SYS_3A=true`），`adb uninstall` 后 install，
+  17:26 装到 192.168.3.69:5555，启动正常（新装弹麦克风授权）。
+- iOS：push bd2c408 → 触发 `ios-release.yml`（run 43191820850）→ 下载 IPA → pymobiledevice3 装机。
+
+### 真机复测要点（本轮）
+1. 状态卡新增「**系统3A上行**」：Android 应显示「开 · VOICE_COMM 双流」；若显示「回退」，
+   说明第二条流被系统抢占，看日志回退原因（此时上行仍可用，只是回到 AEC3 链）。
+2. **重点验证啸叫是否还起**：两端正常对话 30s+，不应再出现金属尖叫。若仍偶发，看守卫
+   「已触发 N 次」与「啸叫陷波」锁频——现在应 5s 内锁到 1.5~3.8kHz 并双侧挖。
+3. iOS 成品带宽：VPIO 可能收窄高频，属预期取舍（TRTC 通话档同样）；要保 iOS 全频带可
+   `SYS_3A=false` 出包 A/B，但啸叫抑制会弱。
+4. Android 成品仍应 20kHz 全频带（双流设计，裸麦链没动）。
