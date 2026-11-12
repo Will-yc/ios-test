@@ -26,6 +26,12 @@ AEC3_EXPORT void aec3_destroy(Aec3Bridge *b);
 /// 清理内部状态（换文件/续录时调用）。保留已分配的滤波器，避免重收敛开销。
 AEC3_EXPORT void aec3_reset(Aec3Bridge *b);
 
+/// 高频旁路开关（TRTC 式全频带，仅 48kHz 生效）。
+/// 开启后 0~8kHz 取 AEC 输出、8kHz 以上原样取采集输入 —— 因为 16k opus
+/// 参考信号在 8kHz 以上恒为零，那些频带没有回声，AEC3 只会误伤本端人声。
+/// 传 0 关闭（行为与旧版完全一致）。
+AEC3_EXPORT void aec3_set_high_band_bypass(Aec3Bridge *b, int enable);
+
 /// 喂入"正在播放给扬声器"的参考 PCM（int16 交错）。
 /// 必须与 aec3_process_capture 使用同一采样率、同一时间轴。
 /// 返回累计可用的参考样本数（供调用方观测是否供数不足）。

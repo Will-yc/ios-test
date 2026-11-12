@@ -128,6 +128,8 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   int _aecStarved = 0;
   int _aecBytesIn = 0;
   int _aecBytesOut = 0;
+  // 高频旁路是否真的生效（由 worker 的 init-over 回报，旧 native 库会为 false）
+  bool _highBandBypass = false;
 
   // ---------- 参考信号延迟队列 ----------
   // 播放侧交来的字节先压 kRefDelayMs 再喂 AEC（详见 kRefDelayMs 注释）。
@@ -302,6 +304,12 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
         case 'aec-unavailable':
           _log('⚠️ AEC3 句柄创建失败，本次直通');
           break;
+        case 'init-over':
+          if (!mounted) return;
+          setState(() {
+            _highBandBypass = message['highBandBypass'] == true;
+          });
+          break;
         case 'aec_stats':
           if (!mounted) return;
           setState(() {
@@ -473,6 +481,16 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           sampleRate: kSampleRateRecorder,
           numChannels: kChannels,
           device: mic,
+          // TRTC 式全频带：明确走物理麦克风 + MODE_NORMAL，且关闭系统 3A。
+          // 一旦让系统按「通话/语音识别」通路处理输入，Android 会把带宽
+          // 限到 16kHz 并叠加系统 AEC/AGC —— 那正是我们要用 AEC3 自己做的事。
+          androidConfig: const AndroidRecordConfig(
+            audioSource: AndroidAudioSource.mic,
+            audioManagerMode: AudioManagerMode.modeNormal,
+          ),
+          autoGain: false,
+          echoCancel: false,
+          noiseSuppress: false,
         ),
       );
       _micSub = stream.listen(
@@ -755,7 +773,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
               AVAudioSessionRouteSharingPolicy.defaultPolicy,
           avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
           androidAudioAttributes: const AndroidAudioAttributes(
-            contentType: AndroidAudioContentType.speech,
+            // music 而不是 speech：speech 会让部分 ROM 把整条输入通路切到
+            // 「通话」档（16kHz 带宽 + 系统 3A），把 20kHz 的齿音/空气感砍掉。
+            contentType: AndroidAudioContentType.music,
             flags: AndroidAudioFlags.none,
             usage: AndroidAudioUsage.media,
           ),
@@ -907,6 +927,8 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           '两台设备都别戴耳机、音量开到常用大小。一端选 A、一端选 B，'
           '房间号必须一样。开始后直接说话，成品里只会剩本端人声。\n'
           '前 1~2 秒是 AEC 收敛期，导出时保留原样。\n'
+          '成品是 48kHz 全频带（高频旁路已开，可到 20kHz）；对讲上行仍按房间协议'
+          '走 16k opus，所以「对方听到的」只有 8kHz 带宽，这是协议限制，不是录音问题。\n'
           '外放音量越大，麦克风拾到的回声越强，AEC 能压掉的比例是固定的 —— '
           '想听感更干净就把系统音量调小一档。',
           style: TextStyle(color: cs.onSecondaryContainer, height: 1.45),
@@ -1040,6 +1062,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
               '参考补偿',
               '${kRefDelayMs}ms',
               ok: kRefDelayMs > 0,
+            ),
+            _row(
+              '高频旁路',
+              _highBandBypass ? '开 · 成品可达 20kHz' : '关 · 旧行为',
+              ok: _highBandBypass,
             ),
             const Divider(height: 18),
             _row('录制时长', _fmt(_elapsed)),

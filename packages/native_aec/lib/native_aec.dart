@@ -19,6 +19,9 @@ typedef _Aec3CreateD = Pointer<Void> Function(int sampleRate, int channels);
 typedef _Aec3HandleOnlyC = Void Function(Pointer<Void> handle);
 typedef _Aec3HandleOnlyD = void Function(Pointer<Void> handle);
 
+typedef _Aec3SetFlagC = Void Function(Pointer<Void> handle, Int32 enable);
+typedef _Aec3SetFlagD = void Function(Pointer<Void> handle, int enable);
+
 typedef _Aec3PushRefC =
     Int32 Function(Pointer<Void> handle, Pointer<Int16> pcm, Int32 samples);
 typedef _Aec3PushRefD =
@@ -73,6 +76,7 @@ class _Aec3Ffi {
     required this.process,
     required this.stats,
     required this.version,
+    this.setHighBandBypass,
   });
 
   final _Aec3CreateD create;
@@ -82,6 +86,9 @@ class _Aec3Ffi {
   final _Aec3ProcessD process;
   final _Aec3StatsD stats;
   final _Aec3VersionD version;
+  // 旧版 native 库没有这个符号，缺失时置 null（自动退回旧行为），不能让
+  // 整个 FFI 初始化失败 —— 否则录音会连 AEC 一起退化成直通。
+  final _Aec3SetFlagD? setHighBandBypass;
 
   static bool _tried = false;
   static _Aec3Ffi? _instance;
@@ -89,6 +96,14 @@ class _Aec3Ffi {
   static _Aec3Ffi? get instance {
     if (_tried) return _instance;
     _tried = true;
+    _Aec3SetFlagD? setFlag;
+    try {
+      setFlag = _dylib
+          .lookup<NativeFunction<_Aec3SetFlagC>>('aec3_set_high_band_bypass')
+          .asFunction();
+    } catch (_) {
+      setFlag = null; // 旧库：保持旧行为
+    }
     try {
       _instance = _Aec3Ffi(
         create: _dylib
@@ -112,6 +127,7 @@ class _Aec3Ffi {
         version: _dylib
             .lookup<NativeFunction<_Aec3VersionC>>('aec3_build_info')
             .asFunction(),
+        setHighBandBypass: setFlag,
       );
     } catch (_) {
       _instance = null;
@@ -163,16 +179,33 @@ class Aec3Processor {
 
   /// 创建失败（库缺失 / 该 ABI 未链接 APM / 参数不支持）返回 null，
   /// 调用方应降级为直通 —— 不影响录音本身，只是没有回声消除。
-  static Aec3Processor? tryCreate({int sampleRate = 48000}) {
+  static Aec3Processor? tryCreate({
+    int sampleRate = 48000,
+    bool highBandBypass = false,
+  }) {
     final ffi = _Aec3Ffi.instance;
     if (ffi == null) return null;
     try {
       final h = ffi.create(sampleRate, 1);
       if (h == nullptr) return null;
-      return Aec3Processor._(ffi, h, sampleRate);
+      final proc = Aec3Processor._(ffi, h, sampleRate);
+      proc._highBandBypass = proc.setHighBandBypass(highBandBypass);
+      return proc;
     } catch (_) {
       return null;
     }
+  }
+
+  /// 本次是否真的启用了高频旁路（旧库缺符号、非 48kHz 时为 false）。
+  bool _highBandBypass = false;
+  bool get highBandBypassEnabled => _highBandBypass;
+
+  /// 开/关高频旁路。返回是否生效。
+  bool setHighBandBypass([bool enable = true]) {
+    final set = _ffi.setHighBandBypass;
+    if (_disposed || set == null) return false;
+    set(_handle, enable ? 1 : 0);
+    return enable && sampleRate == 48000;
   }
 
   bool get isDisposed => _disposed;

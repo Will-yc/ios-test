@@ -15,6 +15,18 @@ const int kChannels = 1;
 /// 对讲只传 16k opus（24kbps 级别），成品求质、传输求通是两条独立需求。
 const int kSampleRateUplink = 16000;
 
+/// 高频旁路（TRTC 式全频带）开关。默认开。
+///
+/// 成品走的是「48k 采集 → AEC3(48k) → 48k 落盘」，与上行 16k opus 无关，
+/// 所以本地成品可以做到 20kHz 带宽；但 WebRTC AEC3 在 48kHz 下会把低子带的
+/// 抑制增益套到 8kHz 以上的高子带，而参考信号（16k opus）在 8kHz 以上恒为
+/// 零 —— 那里根本没有回声，只会把本端人声的齿音/空气感压掉 30~40dB。
+/// 开启后 0~8kHz 取 AEC 输出、8kHz 以上原样取采集，样本数与时间轴不变。
+/// 用 `--dart-define=FULLBAND=false` 可退回旧行为做 A/B 对照。
+/// 注意用 String.fromEnvironment：bool.fromEnvironment 读不到 dart-define 字符串。
+const bool kHighBandBypass =
+    String.fromEnvironment('FULLBAND', defaultValue: 'true') == 'true';
+
 /// 后台音频处理与 I/O 线程（必须是顶层函数）。
 ///
 /// 移植自 `zyxc-record-app/lib/module/chat/audio/my_dual_audio_processing_worker.dart`，
@@ -87,7 +99,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
 
             // AEC3：续录只清帧缓存/统计，保留自适应滤波器（重新收敛要 ~1s）
             if (message['aecEnabled'] == true) {
-              aec ??= Aec3Processor.tryCreate(sampleRate: kSampleRateRecorder);
+              aec ??= Aec3Processor.tryCreate(
+                sampleRate: kSampleRateRecorder,
+                highBandBypass: kHighBandBypass,
+              );
               aec?.reset();
               if (aec == null) {
                 mainSendPort.send({'type': 'aec-unavailable'});
@@ -112,7 +127,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
               channels: Channels.mono,
               application: Application.voip,
             );
-            mainSendPort.send({'type': 'init-over'});
+            mainSendPort.send({
+              'type': 'init-over',
+              'highBandBypass': aec?.highBandBypassEnabled ?? false,
+            });
             break;
 
           case 'isWriteRecordFile':

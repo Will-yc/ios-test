@@ -257,6 +257,7 @@ jobs:
             --release \
             --dart-define=ROOM_TEST=true \
             --dart-define=ROOM_ID=aec3test \
+            --dart-define=KEEP_RAW=true \
             --export-options-plist=ios/ExportOptions.plist
 
       - name: Upload IPA

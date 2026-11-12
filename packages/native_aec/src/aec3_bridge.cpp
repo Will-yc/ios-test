@@ -27,6 +27,17 @@
 
 #define AEC3_MAX_FRAME 480  // 48kHz 下 10ms
 
+// 分带截止频率（Hz）。参考信号来自 16kHz opus，解码到 48kHz 后 8kHz 以上
+// 恒为零 —— 也就是说**回声只存在于 0~8kHz**，8kHz 以上没有任何回声需要消。
+constexpr int kSplitHz = 8000;
+constexpr double kPi = 3.14159265358979323846;
+// 线性相位 FIR：65 抽头、群延迟 32 样本（48kHz 下 0.67ms）。
+// 为什么不能用 IIR/biquad：IIR 有相位偏移，`in - LP(in)` 不是互补高通，
+// 低带会残留 +1~+5dB 的相位差分量，等于把 AEC 刚消掉的回声又补回来。
+constexpr int kFirTaps = 65;
+constexpr int kFirDelay = (kFirTaps - 1) / 2;
+constexpr int kFirHist = kFirTaps + kFirDelay;
+
 namespace {
 
 inline int16_t Clamp16(int v) {
@@ -34,6 +45,41 @@ inline int16_t Clamp16(int v) {
   if (v < -32768) return -32768;
   return static_cast<int16_t>(v);
 }
+
+/// 窗函数 sinc 低通（线性相位）。h[n] = 2fc/fs * sinc(2fc*n/fs) * Hamming。
+/// 对 in 与 apm 用**同一组系数 + 各自的历史队列**，输出
+///   LP(apm)[n] + in[n-D] - LP(in)[n]
+/// 低带取 APM 结果、高带取 D 样本前的原始采集；apm==in 时精确等于 in[n-D]
+/// （只多 D 个样本的固定延迟，样本数守恒、时间轴长度不变）。
+struct SplitFir {
+  double h[kFirTaps] = {};
+
+  SplitFir() {
+    double sum = 0.0;
+    for (int k = 0; k < kFirTaps; ++k) {
+      const int n = k - kFirDelay;
+      const double v = (n == 0)
+                           ? (1.0 / 3.0)
+                           : std::sin(kPi * n / 3.0) / (kPi * n);
+      const double win =
+          0.54 - 0.46 * std::cos(2.0 * kPi * k / (kFirTaps - 1));
+      h[k] = v * win;
+      sum += h[k];
+    }
+    for (double &c : h) c /= sum; // DC 增益精确为 1
+  }
+
+  static double lowpass(const std::deque<int16_t> &hist, const double *h) {
+    double y = 0.0;
+    const int n = static_cast<int>(hist.size());
+    for (int k = 0; k < kFirTaps; ++k) {
+      const int idx = n - 1 - k;
+      if (idx < 0) break;
+      y += h[k] * hist[idx];
+    }
+    return y;
+  }
+};
 
 }  // namespace
 
@@ -44,6 +90,14 @@ struct Aec3Bridge {
 
   std::vector<int16_t> pending;  // 未满一帧的采集残留
   std::deque<int16_t> ref;       // 参考信号队列（按样本计）
+
+  // 高频旁路（TRTC 式全频带）：APM 的 48kHz 三子带处理会用低带增益去压
+  // 8kHz 以上的高子带，但那些频带里根本没有回声，只会把本端人声的齿音、
+  // 空气感削掉 30~40dB。开启后 8kHz 以上原样取自采集。
+  bool high_band_bypass = false;
+  SplitFir fir;                  // 系数只构造一次（每次 create）
+  std::deque<int16_t> raw_hist;  // 采集历史（跨 10ms 帧保持）
+  std::deque<int16_t> apm_hist;  // APM 输出历史
 
   // 统计（指数滑动，反映"最近"而不是全程平均）
   double rms_in = 0.0;
@@ -87,10 +141,21 @@ Aec3Bridge *aec3_create(int sample_rate, int channels) {
 
 void aec3_destroy(Aec3Bridge *b) { delete b; }
 
+void aec3_set_high_band_bypass(Aec3Bridge *b, int enable) {
+  if (b == nullptr) return;
+  // 仅在 48kHz 下有意义：16k/32k 输入本来就没有可保留的高频带
+  b->high_band_bypass =
+      (enable != 0 && b->stream.sample_rate_hz() == 48000);
+  b->raw_hist.clear();
+  b->apm_hist.clear();
+}
+
 void aec3_reset(Aec3Bridge *b) {
   if (b == nullptr) return;
   b->pending.clear();
   b->ref.clear();
+  b->raw_hist.clear();
+  b->apm_hist.clear();
   b->rms_in = 0.0;
   b->rms_out = 0.0;
   b->processed_frames = 0;
@@ -144,6 +209,33 @@ int aec3_process_capture(Aec3Bridge *b, const int16_t *in, int samples,
       std::memcpy(cap_frame, b->pending.data() + pos, sizeof(int16_t) * fs);
     }
 
+    // ---- 高频旁路：低带用 AEC 结果，高带用原始采集 ----
+    // 参考信号是 16k opus（8kHz 带宽），8kHz 以上没有回声可消；AEC3 在 48kHz
+    // 下的三子带抑制却会把低带增益套到高子带，把本端人声的 8~20kHz 一并压掉。
+    // 线性相位 FIR 分带：LP(apm)[n] + in[n-D] - LP(in)[n]，D=32 样本。
+    // 只有 0.67ms 固定延迟，样本数守恒，0~8kHz 的消回声结果逐点保留。
+    if (b->high_band_bypass) {
+      for (int i = 0; i < fs; ++i) {
+        const int16_t raw = b->pending[pos + i];
+        const int16_t processed = cap_frame[i];
+        b->raw_hist.push_back(raw);
+        b->apm_hist.push_back(processed);
+        if (b->raw_hist.size() > static_cast<size_t>(kFirHist)) {
+          b->raw_hist.pop_front();
+        }
+        if (b->apm_hist.size() > static_cast<size_t>(kFirHist)) {
+          b->apm_hist.pop_front();
+        }
+
+        const double lp_apm = SplitFir::lowpass(b->apm_hist, b->fir.h);
+        const double lp_raw = SplitFir::lowpass(b->raw_hist, b->fir.h);
+        const int di = static_cast<int>(b->raw_hist.size()) - 1 - kFirDelay;
+        const double delayed_raw = di >= 0 ? b->raw_hist[di] : 0.0;
+        const double mixed = lp_apm + delayed_raw - lp_raw;
+        cap_frame[i] = Clamp16(static_cast<int>(std::lround(mixed)));
+      }
+    }
+
     // ---- 统计 ----
     double sin_sq = 0.0, sout_sq = 0.0;
     for (int i = 0; i < fs; ++i) {
@@ -184,7 +276,7 @@ void aec3_get_stats(Aec3Bridge *b, int *in_db10, int *out_db10,
 }
 
 const char *aec3_build_info(void) {
-  return "webrtc-audio-processing m155.8059.4.0 (AEC3 only, mono, 16/32/48k)";
+  return "webrtc-audio-processing m155.8059.4.0 (AEC3 only, mono, 16/32/48k, fullband-bypass)";
 }
 
 }  // extern "C"
