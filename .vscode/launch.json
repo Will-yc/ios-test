@@ -26,6 +26,39 @@
         "program": "lib/main.dart",
         "flutterMode": "profile",
         "cwd": "${workspaceFolder}"
+        },
+        {
+        // 免提对讲实测（Debug/JIT）：直接进房间页，并落 _raw.pcm 供离线算 ERLE。
+        // 与命令行等价：
+        //   flutter run --dart-define=ROOM_TEST=true --dart-define=ROOM_ID=aec3test --dart-define=KEEP_RAW=true
+        // 房间号/服务地址的编译期默认值本来就是 aec3test / appapi.zhiyuexc.com，
+        // 这里显式写出来只为一眼看清，改房间不用动代码。
+        "name": "AEC3 实测房间 (Debug)",
+        "type": "dart",
+        "request": "launch",
+        "program": "lib/main.dart",
+        "cwd": "${workspaceFolder}",
+        "toolArgs": [
+            "--dart-define=ROOM_TEST=true",
+            "--dart-define=ROOM_ID=aec3test",
+            "--dart-define=KEEP_RAW=true"
+        ]
+        },
+        {
+        // 同上，但走 AOT。音频链路里重采样/陷波/门控都是 Dart 实现，
+        // JIT + 断点会让 isolate 跟不上实时帧长，听感上是爆音/断续，
+        // 会把「算法问题」和「调试器开销」混在一起。真正评价音质用这个。
+        "name": "AEC3 实测房间 (Profile)",
+        "type": "dart",
+        "request": "launch",
+        "program": "lib/main.dart",
+        "flutterMode": "profile",
+        "cwd": "${workspaceFolder}",
+        "toolArgs": [
+            "--dart-define=ROOM_TEST=true",
+            "--dart-define=ROOM_ID=aec3test",
+            "--dart-define=KEEP_RAW=true"
+        ]
         }
     ]
 }
