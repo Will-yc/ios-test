@@ -197,7 +197,7 @@ class Aec3Processor {
   static Aec3Processor? tryCreate({
     int sampleRate = 48000,
     bool highBandBypass = false,
-    int nlpLevel = 2,
+    int nlpLevel = 0,
   }) {
     final ffi = _Aec3Ffi.instance;
     if (ffi == null) return null;
@@ -226,7 +226,9 @@ class Aec3Processor {
   }
 
   /// 当前 NLP（残余抑制）档位。0=默认 / 1=温和 / 2=狠 / 3=极狠。
-  int _nlpLevel = 2;
+  /// 默认 0：成品残余清尾交给自搜延迟相关门（ResidualGate），AEC3 用默认
+  /// suppressor 即可，避免与门叠加过度压双讲（对齐 0e5d560 无杂音基线）。
+  int _nlpLevel = 0;
   int get nlpLevel => _nlpLevel;
 
   /// 切换 NLP 档（对标 TRTC aec_nlp_level）。返回 native 是否支持并执行。

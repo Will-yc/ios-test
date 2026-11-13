@@ -94,9 +94,8 @@ final int kPlayGainPct = math.min(
 ///   2. **回声照旧**：播放走 FlutterPcmSound 自己的 AudioUnit，VPIO 的 AEC
 ///      参考不到这条渲染流，实测 iOS 成品里对方声音照样在；且真机网络
 ///      单向延迟 2~3s，任何按「小延迟」设计的系统 AEC 都追不上。
-/// 现在两端统一：裸麦 48k → worker AEC3（含分级 NLP 残余抑制，对标 TRTC
-/// aec_nlp_level）。回声抑制全交给 AEC3 频域 suppressor，对齐由其内部样本级
-/// 跟踪，天然不受网络延迟影响；上行与成品共用同一份 AEC3 输出。
+/// 现在两端统一：裸麦 48k → worker AEC3 + 相关门（门用本地播放参考自搜
+/// 延迟，天然不受网络延迟影响），上行与成品共用门的判决。
 /// 仅做 A/B 对照时用 --dart-define=SYS_3A=true 打开。
 const bool kSys3A =
     String.fromEnvironment('SYS_3A', defaultValue: 'false') == 'true';
@@ -183,10 +182,8 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   int _aecBytesOut = 0;
   // 高频旁路是否真的生效（由 worker 的 init-over 回报，旧 native 库会为 false）
   bool _highBandBypass = false;
-  // AEC3 残余抑制（NLP）档位（对标 TRTC aec_nlp_level）：0默认/1温和/2狠/3极狠
-  int _nlpLevel = 2;
-  // native 库是否支持运行时换档（旧库缺 aec3_set_nlp_level 符号时为 false）
-  bool _nlpSupported = true;
+  // 下行相关门（成品彻底无回声）是否开启
+  bool _residualGate = false;
   // 采集侧啸叫陷波是否在岗（worker 回报）
   bool _howlNotch = false;
   // 采集侧底噪门是否在岗
@@ -196,6 +193,10 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   // worker 是否已完成初始化（未初始化时下面几行显示的是初始值，
   // 直接写「关」会让人误以为被编译期关掉了 —— 真机问过一次）
   bool _audioInited = false;
+  // 相关门自搜出来的回声延迟与当帧读数（诊断：lag 不合理就说明这层没工作）
+  int _gateLagMs = -1;
+  double _gateRho = 0;
+  bool _gateConverged = true; // false = 收敛期静音中（冷启动压死下行）
   double _noiseFloorDb = -90;
   // 当前真正在挖的陷波频点
   List<double> _notchHz = const <double>[];
@@ -408,18 +409,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           if (!mounted) return;
           setState(() {
             _highBandBypass = message['highBandBypass'] == true;
-            _nlpLevel = (message['nlpLevel'] as num?)?.toInt() ?? _nlpLevel;
+            _residualGate = message['residualGate'] == true;
             _howlNotch = message['howlNotch'] == true;
             _noiseGate = message['noiseGate'] == true;
             _upstreamAgc = message['upstreamAgc'] == true;
             _audioInited = true;
-          });
-          break;
-        case 'nlp_level_ack':
-          if (!mounted) return;
-          setState(() {
-            _nlpLevel = (message['level'] as num?)?.toInt() ?? _nlpLevel;
-            _nlpSupported = message['supported'] == true;
           });
           break;
         case 'howl_notch_ack':
@@ -438,7 +432,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
             _aecStarved = (message['starved'] as num?)?.toInt() ?? 0;
             _aecBytesIn = (message['bytesIn'] as num?)?.toInt() ?? 0;
             _aecBytesOut = (message['bytesOut'] as num?)?.toInt() ?? 0;
-            _nlpLevel = (message['nlpLevel'] as num?)?.toInt() ?? _nlpLevel;
+            _gateLagMs = (message['gateLagMs'] as num?)?.toInt() ?? -1;
+            _gateRho = (message['gateRho'] as num?)?.toDouble() ?? 0;
+            _gateConverged = message['gateConverged'] != false;
             _noiseFloorDb = (message['noiseFloor'] as num?)?.toDouble() ?? -90;
           });
           break;
@@ -1462,35 +1458,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
                     ),
                 ],
               ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  const Text('回声抑制'),
-                  const SizedBox(width: 12),
-                  DropdownButton<int>(
-                    value: _nlpLevel,
-                    isDense: true,
-                    items: const [
-                      DropdownMenuItem<int>(value: 0, child: Text('0 默认')),
-                      DropdownMenuItem<int>(value: 1, child: Text('1 温和')),
-                      DropdownMenuItem<int>(value: 2, child: Text('2 狠')),
-                      DropdownMenuItem<int>(value: 3, child: Text('3 极狠')),
-                    ],
-                    onChanged: (int? v) {
-                      if (v == null || v == _nlpLevel) return;
-                      final int old = _nlpLevel;
-                      setState(() => _nlpLevel = v);
-                      _workerSendPort?.send({'type': 'nlp_level', 'level': v});
-                      _log('⚙️ AEC3 NLP $old → $v（换档重建 APM，重新收敛 ~1s）');
-                    },
-                  ),
-                  const Spacer(),
-                  const Text(
-                    'TRTC aec_nlp_level',
-                    style: TextStyle(fontSize: 11, color: Colors.grey),
-                  ),
-                ],
-              ),
               if (_calibResult != null)
                 Padding(
                   padding: const EdgeInsets.only(top: 2),
@@ -1614,13 +1581,19 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
               ok: _audioInited && _highBandBypass,
             ),
             _row(
-              'AEC3 NLP',
+              '残留门',
               !_audioInited
                   ? '— 待开录'
-                  : '${switch (_nlpLevel) { 0 => '默认', 1 => '温和', 3 => '极狠', _ => '狠' }}'
-                      ' · 抑制 ${(_inDbfs - _outDbfs).toStringAsFixed(1)}dB'
-                      '${_nlpSupported ? '' : ' · 旧库固定档'}',
-              ok: _audioInited,
+                  : !_residualGate
+                  ? '关 · 仅 AEC3'
+                  : (_gateLagMs < 0
+                      ? (_gateConverged
+                          ? '开 · 正在搜回声延迟'
+                          : '开 · 收敛期静音中（压死冷启动回声）')
+                      : (_gateConverged
+                          ? '开 · 对齐 $_gateLagMs ms（ρ=${_gateRho.toStringAsFixed(2)}）'
+                          : '开 · 已对齐 $_gateLagMs ms，稳定中…')),
+              ok: _audioInited && _residualGate && _gateConverged && _gateLagMs >= 0,
             ),
             _row(
               '啸叫陷波',
@@ -1645,7 +1618,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
             _row(
               '系统3A上行',
               !kSys3A
-                  ? '关 · 裸麦48k→AEC3(NLP) 上行'
+                  ? '关 · 裸麦48k→AEC3+相关门 上行'
                   : Platform.isIOS
                       ? '开 · iOS VPIO 单流（成品会被限带宽）'
                       : (kAndroidDualStream
