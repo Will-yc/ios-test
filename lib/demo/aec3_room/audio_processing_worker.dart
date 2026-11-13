@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:my_flutter_app/demo/util/my_dual_resampler_rate.dart';
 import 'package:native_aec/native_aec.dart';
+import 'package:my_flutter_app/demo/aec3_room/comfort_noise.dart';
 import 'package:my_flutter_app/demo/aec3_room/howl_notch.dart';
 import 'package:my_flutter_app/demo/aec3_room/noise_gate.dart';
 import 'package:my_flutter_app/demo/aec3_room/residual_gate.dart';
@@ -60,6 +61,14 @@ const bool kDoubleTalkGuard =
 const bool kNoiseGate =
     String.fromEnvironment('NOISE_GATE', defaultValue: 'true') == 'true';
 
+/// 底噪垫开关（成品链路最后一道地板保护）。默认开。
+///
+/// 相关门与底噪门串联时安静段会被压到 16bit 量化以下，成品里出现 0.3~0.5s
+/// 的**纯数字静音**（频谱上的竖直断口）。这一层只把被压穿的帧补回「本该有的
+/// 底噪电平」，语音帧不动。用 `--dart-define=COMFORT_NOISE=false` 做 A/B。
+const bool kComfortNoise =
+    String.fromEnvironment('COMFORT_NOISE', defaultValue: 'true') == 'true';
+
 /// 采集侧啸叫陷波开关。默认开。
 ///
 /// 两台设备**不在同一空间**也照样啸叫，因为回路不是靠「两机之间的空气」闭合的：
@@ -97,6 +106,19 @@ const bool kUpstreamAgc =
 ///        └─→ 底噪门 → 48k→16k → opus(20ms) → WS 二进制
 ///
 /// 原工程的转码/上传/元数据/sidecar 分支全部去掉 —— 本工程只验证外放 AEC。
+/// 一帧 int16-LE PCM 的 RMS 电平（dBFS）。
+double frameDbfs(Uint8List pcm) {
+  if (pcm.length < 2) return -90;
+  final int n = pcm.length ~/ 2;
+  final ByteData bd = ByteData.view(pcm.buffer, pcm.offsetInBytes, n * 2);
+  double sumSq = 0;
+  for (int i = 0; i < n; i++) {
+    final int v = bd.getInt16(i * 2, Endian.little);
+    sumSq += v * v;
+  }
+  return 20 * (math.log(math.sqrt(sumSq / n) / 32768 + 1e-12) / math.ln10);
+}
+
 void audioProcessingWorker(SendPort mainSendPort) {
   final workerReceivePort = ReceivePort();
   mainSendPort.send(workerReceivePort.sendPort);
@@ -108,6 +130,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
     /// 诊断用：AEC **之前**的原始采集（只在该开关打开时有值）。
     /// 有了它就能离线直接算 ERLE / 看残余，不必靠人耳判断「还有没有回声」。
     IOSink? rawSink;
+    // 诊断轨道：AEC 实际看到的参考（页面压过 REF_DELAY 后送来的播放字节）。
+    // 有了它和 _raw.pcm，离线就能算出真实 ERLE 与回声延迟，不用再靠听感猜。
+    IOSink? refSink;
 
     bool isWriteRecordFile = false;
     bool isFirstChunk = true;
@@ -152,6 +177,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
     final NoiseGate? noiseGateOut =
         kNoiseGate ? NoiseGate(sampleRate: kSampleRateRecorder) : null;
 
+    // 地板保护：只补成品，不补上行（上行垫噪声等于对对方放嘶声）。
+    final ComfortNoise? comfort =
+        kComfortNoise ? ComfortNoise() : null;
+
     await for (final message in workerReceivePort) {
       if (message is! Map) continue;
       final String type = message['type'];
@@ -167,6 +196,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
             await rawSink?.flush();
             await rawSink?.close();
             rawSink = null;
+            await refSink?.flush();
+            await refSink?.close();
+            refSink = null;
             encoder?.dispose();
 
             // 每个分段开始都必须回到"首块"状态（这个 isolate 只建一次，
@@ -212,6 +244,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
             notch?.reset();
             noiseGate?.reset();
             noiseGateOut?.reset();
+            comfort?.reset();
 
             final String? filePath = message['filePath'];
             if (filePath != null && filePath.isNotEmpty) {
@@ -221,6 +254,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
             final String? rawPath = message['rawFilePath'];
             if (rawPath != null && rawPath.isNotEmpty) {
               rawSink = File(rawPath).openWrite();
+            }
+            final String? refPath = message['refFilePath'];
+            if (refPath != null && refPath.isNotEmpty) {
+              refSink = File(refPath).openWrite();
             }
 
             encoder = OpusEncoder(
@@ -251,6 +288,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
               await rawSink?.flush();
               await rawSink?.close();
               rawSink = null;
+              await refSink?.flush();
+              await refSink?.close();
+              refSink = null;
               // 告诉主线程「这段文件的字节已经全部落盘」，导出 wav 必须等它，
               // 否则会读到缺尾巴的文件（wav 头里的长度是对的，内容却短一截）。
               mainSendPort.send({'type': 'file-closed'});
@@ -293,6 +333,8 @@ void audioProcessingWorker(SendPort mainSendPort) {
             // 听到自己的回声，且网络环路对啸叫常开。门用本地播放参考判决，
             // 不受网络延迟影响。代价是双讲时上行也被部分压低 —— 延迟已是
             // 秒级、对话本就轮流说，可接受；成品干净优先。
+            // 门的判决必须看**门之前**的能量；底噪垫的锚点也用它。
+            final double preGateDbfs = frameDbfs(chunk);
             final Uint8List gated = (gate != null && chunk.isNotEmpty)
                 ? gate.process(chunk)
                 : chunk;
@@ -306,6 +348,11 @@ void audioProcessingWorker(SendPort mainSendPort) {
             Uint8List outChunk = gated;
             if (noiseGateOut != null && outChunk.isNotEmpty) {
               outChunk = noiseGateOut.process(outChunk);
+            }
+            // 地板保护：两个门串联后安静段会被压到量化以下（成品里是纯数字
+            // 静音的竖直断口）。按「底噪门本来会留下的电平」把差额补回来。
+            if (comfort != null && outChunk.isNotEmpty) {
+              outChunk = comfort.process(outChunk, preGateDbfs);
             }
 
             // =================== 1. 文件写入（成品：AEC 后的 48k pcm）===================
@@ -364,6 +411,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
             gate?.reset();
             noiseGate?.reset();
             noiseGateOut?.reset();
+            comfort?.reset();
             break;
 
           case 'howl_notch':
@@ -390,6 +438,12 @@ void audioProcessingWorker(SendPort mainSendPort) {
             aec?.pushReference(message['data']);
             // 同时喂给下行相关门（用于判定「这帧里有多少是回声」）
             gate?.pushReference(message['data']);
+            // 诊断轨道：AEC 实际看到的参考（只在 KEEP_RAW 时写）
+            if (refSink != null) {
+              try {
+                refSink.add(message['data']);
+              } catch (_) {}
+            }
             break;
 
           case 'flush_chunk':
@@ -445,6 +499,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
             await rawSink?.flush();
             await rawSink?.close();
             rawSink = null;
+            await refSink?.flush();
+            await refSink?.close();
+            refSink = null;
             encoder?.dispose();
             encoder = null;
             // AEC3 句柄必须跟着 isolate 一起收回，否则每次开录漏一份滤波器内存

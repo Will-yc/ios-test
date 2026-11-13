@@ -165,6 +165,8 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
 
   // ---------- 录音成品 ----------
   String? _pcmPath;
+  // 诊断：每秒一行的门控/陷波/守卫读数（KEEP_RAW 时与 .pcm 同目录落盘）
+  String? _statsPath;
   String _wavPath = '';
   int _pcmBytes = 0;
   Duration _elapsed = Duration.zero;
@@ -427,6 +429,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
             _gateConverged = message['gateConverged'] != false;
             _noiseFloorDb = (message['noiseFloor'] as num?)?.toDouble() ?? -90;
           });
+          _writeStatsLine();
           break;
         case 'file-closed':
           if (_fileClosed != null && !_fileClosed!.isCompleted) {
@@ -512,7 +515,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   ///   判据在 1.9↔2.2kHz 跳频下永远攒不够计数，25s 才锁上一次）；
   /// - 峰频落在 [notchMinHz] ~ [notchMaxHz]（**下限 1200Hz 是硬约束**：
   ///   人声基频 80~400Hz、低次谐波 400~1200Hz 全在下面，挖了就是把人说话
-  ///   挖空；实测啸叫在 1.5~3.8kHz）；
+  ///   挖空；实测啸叫 1.5~3.8kHz，裸麦宽带回环另有一段 5.4~7.9kHz）；
   /// - 采集电平 > -35dBFS：静音期的残余回声（-44dBFS）不配锁频，
   ///   旧版曾在安静段把 1406Hz 残响锁成啸叫；
   /// - 同一频点 ±[mergeHz] 内不重复挖，最多同时挖 3 个；
@@ -524,7 +527,10 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   static const int maxTargets = 3;
   static const int staleMs = 6000;
   static const double notchMinHz = 1200.0;
-  static const double notchMaxHz = 6000.0;
+
+  /// 上限 9kHz：2026-11-13 宽带回环实测自激在 5.4k / 7.9kHz，
+  /// 旧的 6k 边界把 7.9k 挡在外面（守卫侧搜索上限同步抬到 9k）。
+  static const double notchMaxHz = 9000.0;
 
   void _startNotchDetector() {
     _stopNotchDetector();
@@ -879,6 +885,33 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     } catch (_) {}
   }
 
+  /// 每秒一行的诊断记录（与成品 .pcm 同目录的 `_stats.log`）。
+  ///
+  /// 出问题时不靠人耳猜：`in/out` 差 = 当秒 ERLE，`lag` 不合理 = 相关门
+  /// 没对齐，`rho/gain` 看门有没有误压，`floor` 看噪底跟踪，`vote/peak/duck`
+  /// 看守卫是否在把正常语音当啸叫压。KEEP_RAW=false 时什么都不写。
+  void _writeStatsLine() {
+    final String? sp = _statsPath;
+    if (sp == null) return;
+    final int ms = _recordStartAt == null
+        ? 0
+        : DateTime.now().difference(_recordStartAt!).inMilliseconds;
+    final String notch = _notchTargets.isEmpty
+        ? '-'
+        : _notchTargets.map((e) => e.toStringAsFixed(0)).join('/');
+    final String line = 't=${(ms / 1000).toStringAsFixed(1)} '
+        'in=${_inDbfs.toStringAsFixed(1)} out=${_outDbfs.toStringAsFixed(1)} '
+        'lag=$_gateLagMs rho=${_gateRho.toStringAsFixed(2)} '
+        'floor=${_noiseFloorDb.toStringAsFixed(1)} notch=$notch '
+        'vote=${_guard.howlVoteRatio.toStringAsFixed(2)} '
+        'peak=${_guard.lastPeakHz.toStringAsFixed(0)} '
+        'duck=${_guard.duckFactor.toStringAsFixed(2)} '
+        'frames=$_aecFrames starved=$_aecStarved\n';
+    try {
+      File(sp).writeAsStringSync(line, mode: FileMode.append);
+    } catch (_) {}
+  }
+
   Future<void> _beginRecordFile() async {
     final dir = await getApplicationDocumentsDirectory();
     final now = DateTime.now();
@@ -889,6 +922,12 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
         '${now.minute.toString().padLeft(2, '0')}'
         '${now.second.toString().padLeft(2, '0')}';
     final path = '${dir.path}/handsfree_${_identity}_$stamp.pcm';
+    _statsPath = kKeepRaw ? path.replaceAll(RegExp(r'\.pcm$'), '_stats.log') : null;
+    if (_statsPath != null) {
+      try {
+        File(_statsPath!).writeAsStringSync('');
+      } catch (_) {}
+    }
     _fileClosed = Completer<void>();
     _workerSendPort?.send({
       'type': 'init',
@@ -896,6 +935,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       // 诊断轨道：AEC 之前的原始采集（KEEP_RAW=true 才有）
       'rawFilePath':
           kKeepRaw ? path.replaceAll(RegExp(r'\.pcm$'), '_raw.pcm') : null,
+      // 诊断轨道：AEC 实际看到的参考（页面压过 REF_DELAY 后送来的播放字节）
+      'refFilePath':
+          kKeepRaw ? path.replaceAll(RegExp(r'\.pcm$'), '_ref.pcm') : null,
       'aecEnabled': true,
     });
     _workerSendPort?.send({
