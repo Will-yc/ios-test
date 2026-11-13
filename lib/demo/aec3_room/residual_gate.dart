@@ -29,6 +29,19 @@ import 'dart:typed_data';
 ///    本端根本没人说话，剩下的只能是残余 → 直接压到 [gFloor]。
 /// 6. **下行静默直通**：参考电平低于 [silentRefDbfs] 时无回声可消 → 增益 1，
 ///    绝不误压本端说话（这条是硬保护）。
+/// 7. **收敛期静音**（对标 TRTC `convergence_mute` / `aec_beginning_mute`）：
+///    lag 尚未锁定前判决打在假设延迟上、rho 可能恒为 0，冷启动残余会漏出。
+///    解除条件前，只要**下行在响**就把整帧压到 [gFloor]；下行静默仍走第 6 条
+///    直通。锁定后再稳 [convergeSettleFrames] 帧解除；一直锁不上则
+///    [convergeMuteMs] 兜底解除，避免全程哑掉。
+/// 8. **双讲保护**（对标 TRTC `nearend unmute` / `aivad` / `aec_nlp_level`）：
+///    轻量近端 VAD（采集电平 vs 自适应噪底）区分「纯回声」与「双讲」。
+///    纯回声帧维持硬压（成品干净优先）；双讲帧过渡区改软底 [midFloorVoice]
+///    保留本端语音，能量兜底也不触发 → 上行不再因压回声而变半双工。
+/// 9. **参考新鲜度守卫**（对标 TRTC `aec data feed playout lack/recover`）：
+///    播放停顿（网络断层）时参考环冻结、已无新回声，能量兜底（第 5 条）若仍
+///    拿陈旧参考判决，会把停顿期的本端语音误压。距上次 [pushReference] 超过
+///    [refLackFrames] 帧即判参考断流，停用能量兜底、交还 rho 路径直通。
 ///
 /// ## 阈值来源（2026-11-12 真机成品实测，别再拍脑袋改大）
 /// 用当天录音离线算过：纯回声帧（对端说话、本端静默）的 10ms 波形 rho
@@ -50,6 +63,12 @@ class ResidualGate {
     this.smooth = 0.6,
     this.energyDropDb = 14.0,
     this.silentRefDbfs = -55.0,
+    this.convergeMuteMs = 3000,
+    this.doubleTalkGuard = true,
+    this.vadVoiceMarginDb = 10.0,
+    this.vadRhoMax = 0.15,
+    this.midFloorVoice = 0.5,
+    this.refLackFrames = 40,
     this.debug = false,
   });
 
@@ -71,6 +90,59 @@ class ResidualGate {
 
   /// 参考电平低于此值 → 下行静默，无回声可消，强制直通。
   final double silentRefDbfs;
+
+  /// **收敛期静音**（对标 TRTC `convergence_mute` / `aec_beginning_mute_time_ms`）。
+  ///
+  /// 门尚未锁定真实回声延迟前，判决打在 [assumedDelayMs] 假设值上，rho 可能
+  /// 恒为 0 → 冷启动残余回声原样漏出（对端听到自己 / 成品有对方声音）。所以
+  /// 在「已收敛」之前，只要**下行在响**（有回声风险）就把整帧压到 [gFloor]；
+  /// 下行静默时照常直通（无回声可消，绝不能误压本端说话）。
+  ///
+  /// 这是**兜底上限**：即使一直锁不上 lag，超过 [convergeMuteMs] 也无条件解除
+  /// 静音，退回常规 rho/能量判决，避免全程哑掉。正常开局 ~1s 就能锁定并解除。
+  final int convergeMuteMs;
+
+  /// **双讲保护**（对标 TRTC `nearend unmute` / `aivad` / `aec_nlp_level`）。
+  ///
+  /// 旧行为：rho 落在过渡区或能量兜底命中就整帧硬压，双讲（双方同时说）时
+  /// 本端语音也被压掉 → 上行变半双工。TRTC 用近端 VAD 区分「纯回声」与「双讲」：
+  /// 纯回声硬压、双讲改 NLP 分级软压保留本端。这里用轻量 VAD（采集电平 vs
+  /// 自适应噪底，不引 NN 模型）做同样的事：
+  ///  - 近端 VAD 命中（本端在说话）→ 过渡区改用软底 [midFloorVoice]，保留本端；
+  ///  - 近端静默（纯回声）→ 维持硬底 0.10 / 能量兜底 gFloor，成品干净优先。
+  /// 用 `--dart-define=RESIDUAL_GATE_DTLK=false` 可关掉做 A/B（见 worker）。
+  final bool doubleTalkGuard;
+
+  /// 近端 VAD：采集电平高出自适应噪底这么多 dB → 判「本端在说话」。
+  /// 取 10dB：语音明显高于底噪才命中，避免把响一点的回声误判成双讲。
+  final double vadVoiceMarginDb;
+
+  /// 近端 VAD 的相关性上限：rho 必须低于此值才可能判双讲。
+  ///
+  /// 单靠电平分不清「响回声」与「响本端」（AEC3 消不净的残余本身就很响）。
+  /// 真正区分两者的是相关性：双讲时本端语音稀释了与参考的相关，rho 偏低
+  /// （实测混合段 p50≈0.12）；纯回声 rho 偏高（p50≈0.36~0.43）。取 0.15
+  /// （介于 rhoNone 0.06 与 rhoFull 0.28 之间、贴近混合 p50）：rho≥0.15 的帧
+  /// 回声成分仍重，一律按纯回声硬压，不放行；只有 rho 足够低（本端主导）才软压。
+  final double vadRhoMax;
+
+  /// 双讲帧过渡区的软底（0.5 ≈ -6dB）。比纯回声的 0.10(-20dB) 温和得多，
+  /// 只压掉部分回声成分、保留本端语音可懂度。rho 越接近 rhoNone 越接近全开。
+  final double midFloorVoice;
+
+  /// **参考新鲜度守卫**（对标 TRTC `aec data feed playout lack/recover`）。
+  ///
+  /// 能量兜底 [energyDropDb] 的前提是「参考是**当前**播放」——本端比参考低
+  /// 那么多，剩下的才只能是当前回声的残余。但播放会停顿（网络断层 / hardSync
+  /// 后无新包），此时参考环**冻结**在最后一次播放的字节上，已无新回声产生。
+  /// 若仍用这份陈旧参考做能量兜底，本端在停顿期说话（电平低于那段陈旧远端
+  /// 14dB 以上）会被误判成「残余」整句压死。
+  ///
+  /// 守卫：距上次 [pushReference] 超过 [refLackFrames] 帧（默认 40 = 400ms）
+  /// 即判参考断流，**停用能量兜底**，把判决交还给 rho 路径——本端语音与陈旧
+  /// 远端不相关，rho 自然落回 rhoNone 以下直通。40 帧 ≈ 400ms，远大于正常
+  /// 喂参考的间隔（播放泵约每 50ms 喂一次），不会误触发。
+  final int refLackFrames;
 
   /// 打印延迟搜索过程（只在离线验证时打开）。
   final bool debug;
@@ -114,6 +186,10 @@ class ResidualGate {
   /// 防止搜索被语音起伏的等价峰牵着走。
   static const double fineHyst = 0.08;
 
+  /// 锁定后再稳这么多帧（10ms/帧 → 200ms）才解除收敛期静音，
+  /// 避免刚锁上就用一个还没坐实的 lag 放行回声。
+  static const int convergeSettleFrames = 20;
+
   int get _minLag => minDelayMs * sampleRate ~/ 1000;
   int get _maxLag => maxDelayMs * sampleRate ~/ 1000;
 
@@ -129,6 +205,19 @@ class ResidualGate {
   int _sinceSearch = 0;
   double _prevGain = 1.0;
 
+  // ---- 收敛期静音状态 ----
+  int _frameCount = 0; // 已处理的非静音帧计数（用于兜底解除）
+  int _lockFrame = -1; // _lag 首次锁定发生在第几帧
+  bool _converged = false; // 是否已解除收敛期静音
+
+  // ---- 近端 VAD（双讲保护）状态 ----
+  double _vadFloorDb = -90; // 自适应噪底（快降慢升，同 NoiseGate）
+  bool _vadFloorInit = false;
+  bool _lastNearEnd = false; // 上一帧是否判到本端在说话
+
+  // ---- 参考新鲜度（playout lack 守卫）----
+  int _framesSinceRef = 0; // 距上次 pushReference 过了多少采集帧
+
   double _lastRho = 0;
   double _lastCapDbfs = -90;
   double _lastRefDbfs = -90;
@@ -140,6 +229,16 @@ class ResidualGate {
   double get lastCapDbfs => _lastCapDbfs;
   double get lastRefDbfs => _lastRefDbfs;
 
+  /// 是否已解除收敛期静音（lag 已锁定并稳定，或超过兜底时长）。
+  bool get converged => _converged;
+
+  /// 上一帧近端 VAD 是否判到本端在说话（双讲保护命中）。
+  bool get lastNearEnd => _lastNearEnd;
+
+  /// 下行参考是否已断流（播放停顿）：超过 [refLackFrames] 帧没收到参考。
+  /// 断流期间能量兜底停用，判决交还 rho 路径（对标 TRTC playout lack）。
+  bool get refLacking => _framesSinceRef > refLackFrames;
+
   /// 构造完先给一个可用 lag，免得开头几百毫秒完全不管。
   int get _initialLag => assumedDelayMs * sampleRate ~/ 1000;
 
@@ -149,6 +248,7 @@ class ResidualGate {
   /// 下行参考喂入（int16-LE 单声道，任意块长）。
   void pushReference(Uint8List pcm) {
     if (pcm.length < 2) return;
+    _framesSinceRef = 0; // 参考新鲜：重置断流计数
     final int n = pcm.length ~/ 2;
     final ByteData bd = ByteData.view(pcm.buffer, pcm.offsetInBytes, n * 2);
     final Int16List s = Int16List(n);
@@ -176,6 +276,23 @@ class ResidualGate {
     final double capRms = math.sqrt(sumSq / n);
     _lastCapDbfs = 20 * _log10(capRms / 32768.0 + 1e-12);
 
+    // 参考断流计数：每处理一帧采集 +1，pushReference 时清零。超过
+    // refLackFrames 即判播放停顿，下面能量兜底会据此停用（见 residualOnly）。
+    _framesSinceRef++;
+
+    // 近端 VAD 噪底：快降慢升（同 NoiseGate），语音段抬不动噪底。
+    // 用于判「本端在说话」= 采集电平明显高出噪底。
+    if (!_vadFloorInit) {
+      _vadFloorDb = _lastCapDbfs;
+      _vadFloorInit = true;
+    } else if (_lastCapDbfs < _vadFloorDb) {
+      _vadFloorDb += (_lastCapDbfs - _vadFloorDb) * 0.35;
+    } else {
+      _vadFloorDb += math.min(_lastCapDbfs - _vadFloorDb, 0.15) * 0.5;
+    }
+    if (_vadFloorDb < -95) _vadFloorDb = -95;
+    if (_vadFloorDb > -30) _vadFloorDb = -30;
+
     // 帧近乎静音：什么都不用做（也算"直通"，别把增益平滑状态搅乱）。
     // 注意：**绝不能在这里把 _lag 赋成假设值** —— 一旦 _lag >= 0，冷启动
     // 逻辑（长探针 + 无先验）就永久失效，之后一直用短探针在错误先验附近
@@ -183,6 +300,7 @@ class ResidualGate {
     // 判决路径另有 _effectiveLag 兜底，不需要提前赋值。
     if (capRms < 2.0) {
       _lastRho = 0;
+      _lastNearEnd = false;
       _prevGain += (1.0 - _prevGain) * (smooth * 0.5);
       return frame;
     }
@@ -193,6 +311,20 @@ class ResidualGate {
     if (++_sinceSearch >= searchIntervalFrames || _lag < 0) {
       _sinceSearch = 0;
       _searchLag(n);
+    }
+
+    // 收敛期静音状态机：_lag 首次锁定后再稳 convergeSettleFrames 帧才解除；
+    // 若一直锁不上（远端长时间不响 / 搜索失败），到 convergeMuteMs 兜底解除，
+    // 退回常规 rho/能量判决，避免全程哑掉。只统计非静音帧（静音帧上面已早退，
+    // 且静音期无回声风险，静音不会误压本端）。
+    _frameCount++;
+    if (!_converged) {
+      if (_lag >= 0) {
+        if (_lockFrame < 0) _lockFrame = _frameCount;
+        if (_frameCount - _lockFrame >= convergeSettleFrames) _converged = true;
+      }
+      final int capFrames = convergeMuteMs * sampleRate ~/ 1000 ~/ frameSamples;
+      if (_frameCount >= capFrames) _converged = true;
     }
 
     double g = 1.0;
@@ -234,22 +366,63 @@ class ResidualGate {
         final double rho = bestRho;
         _lastRho = rho.clamp(0.0, 1.0);
 
-        if (rho >= rhoFull) {
+        // 能量兜底判据：本端电平远低于参考 → 本端没人说话，剩下的全是残余。
+        // **前提是参考新鲜**：播放停顿（refLacking）时参考环冻结在陈旧字节上、
+        // 已无新回声，此时能量兜底会把停顿期的本端语音误判成残余压死，故停用，
+        // 交还 rho 路径（本端与陈旧远端不相关 → rho 低 → 直通）。
+        final bool residualOnly = !refLacking &&
+            _lastRefDbfs > silentRefDbfs &&
+            _lastCapDbfs < _lastRefDbfs - energyDropDb;
+
+        // 能量主导判据（不依赖 lag 精度，成品优先）：下行在响 + 参考新鲜 +
+        // 采集不比参考响 → 麦克风能量能被下行完全解释 → 回声主导 → 硬压。
+        // 纯回声是参考的衰减副本（采集≤参考）；双讲本端叠加（采集>参考）才放行。
+        //
+        // 🔴 必须覆盖**所有 rho 区间**（2026-11-13 回归修复）：lag 搜不准时纯回声
+        // 的 rho 可落在 0~0.2 任意处。若只在 rho<=rhoNone 分支判能量，会漏掉过渡区
+        // ——rho 略高于 rhoNone 时线性增益≈1，响回声照样原样漏出（离线对照实测：
+        // 错位回声 rho≈0.07 落在过渡区，只压 5.8dB）。故把能量主导提到分支之前，
+        // 一旦命中直接 gFloor，rho 再低也不放行。
+        final bool echoDominant = !refLacking &&
+            _lastRefDbfs > silentRefDbfs &&
+            _lastCapDbfs <= _lastRefDbfs;
+
+        // 近端 VAD（双讲保护，对标 TRTC nearend unmute / aivad）：
+        // 本端在说话 = 采集明显高出噪底 + 相关性低 + **非回声主导（采集>参考）** +
+        // 不是纯残余。命中后过渡区改软压保留本端。纯回声因采集≤参考被 echoDominant
+        // 排除，绝不判双讲（旧版只看 rho<0.15+电平，misaligned 回声被误判软底放行）。
+        _lastNearEnd = doubleTalkGuard &&
+            !residualOnly &&
+            !echoDominant &&
+            rho < vadRhoMax &&
+            _lastCapDbfs > _vadFloorDb + vadVoiceMarginDb;
+
+        if (echoDominant) {
+          g = gFloor;
+        } else if (rho >= rhoFull) {
           g = gFloor;
         } else if (rho <= rhoNone) {
           g = 1.0;
         } else {
           final double t = (rho - rhoNone) / (rhoFull - rhoNone);
-          // 过渡区最深压到 -20dB：实测回声帧 rho 分布宽（p10≈0.09~p90≈0.7），
-          // 旧 midFloor=0.25(-12dB) 时过渡区漏出的对方声音仍清晰可辨。
-          const double midFloor = 0.10;
+          // 过渡区：双讲帧用软底 [midFloorVoice](-6dB) 保留本端（TRTC NLP 分级）；
+          // 纯回声帧仍用硬底 0.10(-20dB)，成品干净优先。
+          final double midFloor = _lastNearEnd ? midFloorVoice : 0.10;
           g = midFloor + (1.0 - midFloor) * (1.0 - t);
         }
 
-        // 能量兜底：本端明显没人说话，剩下的只能是残余
-        if (_lastRefDbfs > silentRefDbfs &&
-            _lastCapDbfs < _lastRefDbfs - energyDropDb) {
+        // 能量兜底：本端明显没人说话，剩下的只能是残余 → 硬压。
+        // 双讲帧（_lastNearEnd）不会命中 residualOnly，本端不被误压。
+        if (residualOnly) {
           g = math.min(g, gFloor);
+        }
+
+        // 收敛期静音：lag 未锁定前，判决打在假设延迟上、rho 可能恒为 0，
+        // 残余回声会原样漏出。此时下行正在响（有回声风险）就把整帧压死，
+        // 冷启动漏声不放行（对标 TRTC convergence_mute / aec_beginning_mute）。
+        // 下行静默走的是上面 refRms<1 的直通分支，不会误压本端。
+        if (!_converged) {
+          g = gFloor;
         }
       }
     }
@@ -517,6 +690,13 @@ class ResidualGate {
     _lastRho = 0;
     _lastCapDbfs = -90;
     _lastRefDbfs = -90;
+    _frameCount = 0;
+    _lockFrame = -1;
+    _converged = false;
+    _vadFloorDb = -90;
+    _vadFloorInit = false;
+    _lastNearEnd = false;
+    _framesSinceRef = 0;
   }
 }
 
