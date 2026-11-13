@@ -101,10 +101,15 @@ final int kPlayGainPct = math.min(
 ///     音质，这是已验收的指标）；另开一条 16k VOICE_COMMUNICATION 流，
 ///     系统 3A 处理后直接编码上行。该流失败/全零 3s 自动回退旧上行。
 ///   - iOS：系统不允许两条采集流，只能单流开 VPIO（echoCancel=true）。
-///     代价是采集带宽可能被系统压到语音档（TRTC 通话同样如此），
-///     我们的 AEC3/门链保留作第二层。--dart-define=SYS_3A=false 可回退 A/B。
+///
+/// 2026-11-13 真机回归：系统 3A 打开时两个成品指标不达标 ——
+///   - Android 双流：第二条 VOICE_COMMUNICATION 流一启动，系统按并发采集
+///     策略把第一条裸麦流静音，成品文件只剩 ~8KB（无数据）；
+///   - iOS VPIO：voiceChat 档把采集带宽压到 ~15kHz，48k 全频带名存实亡。
+/// 故**默认关**：单流裸麦 48k，成品与上行共用我们的 AEC3/门链（对齐
+/// 0e5d560 无杂音基线）。要复现/对照系统 3A 时用 --dart-define=SYS_3A=true。
 const bool kSys3A =
-    String.fromEnvironment('SYS_3A', defaultValue: 'true') == 'true';
+    String.fromEnvironment('SYS_3A', defaultValue: 'false') == 'true';
 
 /// 诊断开关：把 AEC **之前**的原始采集也落一份 `_raw.pcm`，
 /// 重测后可以拿两份文件直接算出真实 ERLE，不用再靠听感判断。
