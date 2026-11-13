@@ -9,7 +9,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:my_flutter_app/demo/aec3_room/audio_playback_manager.dart';
 import 'package:my_flutter_app/demo/aec3_room/audio_processing_worker.dart';
-import 'package:my_flutter_app/demo/aec3_room/delay_calibrator.dart';
 import 'package:my_flutter_app/demo/aec3_room/howl_notch.dart';
 import 'package:my_flutter_app/demo/aec3_room/loop_gain_guard.dart';
 import 'package:my_flutter_app/demo/aec3_room/room_socket.dart';
@@ -61,9 +60,8 @@ const String kDefaultRoomId = String.fromEnvironment(
 /// —— 两端闭环里只要有一端归零，回声残余 ~0dB，环路增益就会过 1，表现为
 /// 双方一停顿就啸叫。所以宁可欠补（留正延迟给 AEC 自己的延迟估计器）。
 ///
-/// 这里的值只是**编译期默认初值**：页面上的「参考补偿」下拉可在运行时改
-/// （100/150/200/250/300），「标定延迟」按钮会播 PN 序列自动测出真机延迟，
-/// 不再靠猜。扫描时两端各跑一次标定即可。
+/// 固定编译期默认值：残留门（ResidualGate）自己搜回声延迟、AEC3 也有自身
+/// 延迟估计器，运行时标定补偿对成品无改善，故已移除「参考补偿/标定」UI。
 final int kRefDelayMs = int.fromEnvironment(
   'REF_DELAY_MS',
   defaultValue: Platform.isAndroid ? 250 : 100,
@@ -213,14 +211,8 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   // 每一端各挖一次，一圈 44dB，比单端挖更快熄振。
   final HowlNotch _playNotch = HowlNotch();
 
-  // ---------- 参考延迟：运行时可调 + 一键标定 ----------
-  int _refDelayMs = kRefDelayMs;
-  static const List<int> kRefDelayOptions = [0, 100, 150, 200, 250, 300];
-  bool _calibActive = false;
-  bool _calibBusy = false;
-  final BytesBuilder _calibCap = BytesBuilder();
-  DateTime? _calibStartAt;
-  DelayEstimate? _calibResult;
+  // ---------- 参考延迟：固定编译期默认（门自搜延迟，无需运行时标定）----------
+  final int _refDelayMs = kRefDelayMs;
 
   // ---------- 参考信号延迟队列 ----------
   // 播放侧交来的字节先压 _refDelayMs 再喂 AEC（详见 kRefDelayMs 注释）。
@@ -262,7 +254,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _uiTimer?.cancel();
-    _calibActive = false;
     _stopRefPump();
     _stopNotchDetector();
     _statusSub?.cancel();
@@ -397,8 +388,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
           // 系统 3A 上行流在岗时，上行由那条流直接编码（见 _onUplinkChunk），
           // worker 这份丢弃；回退后自动恢复转发。
           if (_sysUplinkActive) break;
-          // 标定期间本端在放 PN 序列，别把它发给对端（对方会听到一段噪声）
-          if (_socketStatus == RoomSocketStatus.connected && !_calibActive) {
+          if (_socketStatus == RoomSocketStatus.connected) {
             _socket.sendBinaryMessage(message['data']);
           }
           break;
@@ -462,10 +452,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   void _forwardReference(Uint8List pcm) {
     final port = _workerSendPort;
     if (port == null || _isWorkerClosed || pcm.isEmpty) return;
-    // 标定信号不喂 AEC：它的目的是让回声**原样**留在采集里做互相关，
-    // 一旦被 AEC 消掉，延迟峰就测不出来了。
-    if (_calibActive) return;
-
     if (_refDelayMs <= 0) {
       port.send({'type': 'ref_chunk', 'data': pcm});
       return;
@@ -627,7 +613,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     });
     _guard.reset();
     _log('开始：room=${_roomCtrl.text.trim()} user=$_userId');
-    _log('参考补偿 $_refDelayMs ms（默认 $kRefDelayMs；页面上可实时改，或点「标定延迟」实测）');
 
     try {
       if (!await _recorder.hasPermission()) {
@@ -761,12 +746,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     // 麦克风侧产生的，AEC 之后已被滤波器污染；上一版挂在下行侧更是看错了信号。
     _guard.feedCaptureBytes(chunk);
 
-    // 延迟标定：只收开头 3.1s 的原始采集（回声要保留，不能取 AEC 后的成品）
-    if (_calibActive) {
-      final int ms = DateTime.now().difference(_calibStartAt!).inMilliseconds;
-      if (ms <= 3100) _calibCap.add(chunk);
-    }
-
     final port = _workerSendPort;
     if (port == null || _isWorkerClosed) return;
     port.send({
@@ -853,8 +832,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       _uplinkZeroSince = null;
     }
 
-    // 标定期间不上行（与 worker 上行同规则）
-    if (_calibActive) return;
     if (_socketStatus != RoomSocketStatus.connected) return;
 
     _uplinkBuf.add(chunk);
@@ -935,15 +912,10 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
 
   Future<void> _stopAndExport() async {
     if (_phase != _Phase.live) return;
-    if (_calibBusy) {
-      _toast('标定进行中，请等 3 秒完成再结束');
-      return;
-    }
     setState(() => _phase = _Phase.stopping);
     _log('结束中…');
 
     // 1. 先断采集，再关文件：否则关文件之后还会有一两块写进来
-    _calibActive = false;
     await _micSub?.cancel();
     _micSub = null;
     await _stopSysUplink();
@@ -1065,13 +1037,26 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     }
     final sizeMb = totalBytes / 1024 / 1024;
 
+    // 一段录音最多落 3 个文件（成品 .pcm / 导出 .wav / 原始 _raw.pcm），
+    // 按「去扩展名 + 去 _raw 后缀」的基名归组，提示段数而非文件数，避免 3 倍虚高。
+    final Set<String> recKeys = {};
+    for (final f in files) {
+      final name = f.uri.pathSegments.last;
+      var base = (name.endsWith('.pcm') || name.endsWith('.wav'))
+          ? name.substring(0, name.length - 4)
+          : name;
+      if (base.endsWith('_raw')) base = base.substring(0, base.length - 4);
+      recKeys.add(base);
+    }
+    final int recCount = recKeys.length;
+
     if (!mounted) return;
     final bool? ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('删除所有录音文件？'),
         content: Text(
-          '将要删除 ${files.length} 个文件，共 ${sizeMb.toStringAsFixed(1)} MB，'
+          '将要删除 $recCount 段录音（${files.length} 个文件，共 ${sizeMb.toStringAsFixed(1)} MB），'
           '包含已导出的 wav。此操作不可恢复。',
         ),
         actions: [
@@ -1108,9 +1093,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       _pcmPath = null;
       _pcmBytes = 0;
     });
-    _log('🧹 已删除 $deleted 个文件（${sizeMb.toStringAsFixed(1)} MB）'
+    _log('🧹 已删除 $recCount 段录音 / $deleted 个文件（${sizeMb.toStringAsFixed(1)} MB）'
         '${failed.isEmpty ? '' : '，失败 ${failed.length} 个'}');
-    _toast(failed.isEmpty ? '已删除 $deleted 个文件' : '删除 $deleted 个，${failed.length} 个失败');
+    _toast(failed.isEmpty
+        ? '已删除 $recCount 段录音'
+        : '删除完成，${failed.length} 个文件失败');
   }
 
   Future<void> _share() async {
@@ -1164,64 +1151,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       await session.setActive(true);
     } catch (e) {
       _log('⚠️ 音频会话配置失败: $e');
-    }
-  }
-
-  /// 一键测真机回声延迟（替代靠编译期常量猜 iOS 的 100ms）。
-  ///
-  /// 播放 2s 已知 PN 序列，同时收 3.1s **AEC 前**的原始采集，用 FFT 互相关
-  /// 找峰 —— 峰位置就是「送进播放器 → 扬声器 → 空气 → 麦克风」的端到端延迟。
-  /// 标定期间：不喂 AEC 参考（否则回声被消掉，测不到峰）、不上行（对端不吵）。
-  Future<void> _runCalibration() async {
-    if (_calibBusy) {
-      _toast('标定进行中');
-      return;
-    }
-    if (_phase != _Phase.live) {
-      _toast('先加入房间再标定');
-      return;
-    }
-    setState(() => _calibBusy = true);
-    _log('🔬 标定开始：播放 2s PN 序列，请保持安静、暂时别说话');
-    try {
-      final dir = await getApplicationDocumentsDirectory();
-      final Uint8List ref = buildCalibSignal();
-      _calibCap.clear();
-      _calibStartAt = DateTime.now();
-      _calibActive = true;
-      await File('${dir.path}/calib_ref.pcm').writeAsBytes(ref);
-
-      // 一次性塞进播放缓冲：_tryFillNativeAnchor 按 100ms 水位逐步喂出，
-      // 参考与采集两条时间轴速率都是 48k，互相关峰不会被展宽。
-      _playbackManager?.handleRawPcm(ref);
-
-      await Future<void>.delayed(const Duration(milliseconds: 3300));
-      _calibActive = false;
-      final Uint8List cap = _calibCap.takeBytes();
-      await File('${dir.path}/calib_cap.pcm').writeAsBytes(cap);
-      _log('🔬 采集 ${(cap.length / 1024).toStringAsFixed(0)}KB，计算互相关…');
-      // 标定这 3 秒 AEC 一直缺参考，重置一下让它重新收敛，别污染后续成品
-      _workerSendPort?.send({'type': 'aec_reset'});
-      final DelayEstimate? est = await estimateDelay(ref, cap);
-      if (!mounted) return;
-      setState(() {
-        _calibResult = est;
-        _calibBusy = false;
-      });
-      if (est == null) {
-        _log('🔬 ❌ 标定失败：采集数据太短');
-      } else if (!est.reliable) {
-        _log('🔬 ⚠️ 置信度低 $est（峰不够尖；环境太吵或系统音量太小）');
-      } else {
-        _log('🔬 ✅ 实测端到端 ${est.lagMs.toStringAsFixed(1)}ms，'
-            '相关 ${est.correlation.toStringAsFixed(3)}，'
-            '建议参考补偿 ${est.suggestedRefDelayMs}ms');
-        _log('   把「参考补偿」调到 ${est.suggestedRefDelayMs}ms 后重录一段验证');
-      }
-    } catch (e) {
-      _calibActive = false;
-      if (mounted) setState(() => _calibBusy = false);
-      _log('🔬 ❌ 标定异常: $e');
     }
   }
 
@@ -1346,8 +1275,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
         body: ListView(
           padding: const EdgeInsets.fromLTRB(16, 12, 16, 32),
           children: [
-            _tipCard(cs),
-            const SizedBox(height: 12),
             _configCard(cs),
             const SizedBox(height: 12),
             _actionCard(cs),
@@ -1357,35 +1284,11 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
               const SizedBox(height: 12),
               _resultCard(cs),
             ],
-            const SizedBox(height: 12),
-            _logCard(cs),
           ],
         ),
       ),
     );
   }
-
-  Widget _tipCard(ColorScheme cs) => Container(
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: cs.secondaryContainer,
-          borderRadius: BorderRadius.circular(12),
-        ),
-        child: Text(
-          '两台设备都别戴耳机、音量开到常用大小。一端选 A、一端选 B，'
-          '房间号必须一样。开始后直接说话，成品里只会剩本端人声。\n'
-          '前 1~2 秒是 AEC 收敛期，导出时保留原样。\n'
-          '成品是 48kHz 全频带（高频旁路已开，可到 20kHz）；对讲上行仍按房间协议'
-          '走 16k opus，所以「对方听到的」只有 8kHz 带宽，这是协议限制，不是录音问题。\n'
-          '外放音量越大，麦克风拾到的回声越强，AEC 能压掉的比例是固定的 —— '
-          '想听感更干净就把系统音量调小一档。\n'
-          '采集侧守卫已开：检测到窄带起振或环路增益持续上升，会自动把播放增益'
-          '临时压到 25% 打断啸叫，3 秒后恢复。\n'
-          '首次在某一端跑前，先点「标定延迟」实测这台机器的回声延迟，'
-          '再把「参考补偿」调到建议值；两端各自标定一次。',
-          style: TextStyle(color: cs.onSecondaryContainer, height: 1.45),
-        ),
-      );
 
   Widget _configCard(ColorScheme cs) => Card(
         child: Padding(
@@ -1425,75 +1328,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
                 ],
-              ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  const Text('参考补偿'),
-                  const SizedBox(width: 12),
-                  DropdownButton<int>(
-                    value: _refDelayMs,
-                    isDense: true,
-                    items: [
-                      for (final v
-                          in ({...kRefDelayOptions, _refDelayMs}.toList()..sort()))
-                        DropdownMenuItem<int>(
-                          value: v,
-                          child: Text(v == 0 ? '0（关）' : '${v}ms'),
-                        ),
-                    ],
-                    onChanged: (int? v) {
-                      if (v == null || v == _refDelayMs) return;
-                      final int old = _refDelayMs;
-                      setState(() => _refDelayMs = v);
-                      _log('⚙️ 参考补偿 $old → ${v}ms'
-                          '${_phase == _Phase.live ? '（对讲中平滑过渡：新值只作用于新入队的块）' : ''}');
-                    },
-                  ),
-                  const Spacer(),
-                  if (_calibResult != null)
-                    Text(
-                      '建议 ${_calibResult!.suggestedRefDelayMs}ms',
-                      style: TextStyle(fontSize: 12, color: cs.primary),
-                    ),
-                ],
-              ),
-              if (_calibResult != null)
-                Padding(
-                  padding: const EdgeInsets.only(top: 2),
-                  child: Text(
-                    '实测端到端 ${_calibResult!.lagMs.toStringAsFixed(1)}ms · '
-                    '相关 ${_calibResult!.correlation.toStringAsFixed(3)} · '
-                    '${_calibResult!.reliable ? '结果可用' : '置信度低，仅供试扫'}',
-                    style: const TextStyle(fontSize: 11, color: Colors.grey),
-                  ),
-                ),
-              const SizedBox(height: 8),
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed:
-                      (_phase == _Phase.live && !_calibBusy) ? _runCalibration : null,
-                  icon: _calibBusy
-                      ? const SizedBox(
-                          width: 15,
-                          height: 15,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        )
-                      : const Icon(Icons.graphic_eq, size: 18),
-                  label: Text(
-                    _calibBusy ? '标定中…（3 秒，请保持安静）' : '标定延迟（实测真机回声延迟）',
-                    style: const TextStyle(fontSize: 13),
-                  ),
-                ),
-              ),
-              const Padding(
-                padding: EdgeInsets.only(top: 4),
-                child: Text(
-                  '进房后可点：播放 2 秒轻微噪声，这 3 秒不发给对方、不喂 AEC，'
-                  '用互相关算出真实延迟并给出建议补偿值。',
-                  style: TextStyle(fontSize: 11, color: Colors.grey),
-                ),
               ),
             ],
           ),
@@ -1568,11 +1402,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
                   : '${(_inDbfs - _outDbfs).toStringAsFixed(1)} dB',
             ),
             _row('AEC 帧', _aecFrames == 0 ? '—' : '$_aecFrames（缺参考 $_aecStarved）'),
-            _row(
-              '参考补偿',
-              '$_refDelayMs ms',
-              ok: _refDelayMs > 0,
-            ),
             _row(
               '高频旁路',
               !_audioInited
@@ -1734,32 +1563,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
               ),
             ],
           ),
-        ),
-      );
-
-  Widget _logCard(ColorScheme cs) => Card(
-        child: ExpansionTile(
-          title: const Text('运行日志'),
-          subtitle: Text('${_logs.length} 条'),
-          childrenPadding: const EdgeInsets.fromLTRB(14, 0, 14, 14),
-          initiallyExpanded: _phase == _Phase.live,
-          children: [
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: cs.surfaceContainerHighest,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: SingleChildScrollView(
-                scrollDirection: Axis.vertical,
-                child: Text(
-                  _logs.isEmpty ? '（暂无）' : _logs.join('\n'),
-                  style: const TextStyle(fontSize: 11, height: 1.5),
-                ),
-              ),
-            ),
-          ],
         ),
       );
 
