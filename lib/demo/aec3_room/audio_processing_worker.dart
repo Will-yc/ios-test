@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:my_flutter_app/demo/util/my_dual_resampler_rate.dart';
 import 'package:native_aec/native_aec.dart';
+import 'package:my_flutter_app/demo/aec3_room/comfort_noise.dart';
 import 'package:my_flutter_app/demo/aec3_room/howl_notch.dart';
 import 'package:my_flutter_app/demo/aec3_room/noise_gate.dart';
 import 'package:my_flutter_app/demo/aec3_room/residual_gate.dart';
@@ -47,6 +48,14 @@ const bool kResidualGate =
 /// 用 `--dart-define=NOISE_GATE=false` 退回旧行为做 A/B。
 const bool kNoiseGate =
     String.fromEnvironment('NOISE_GATE', defaultValue: 'true') == 'true';
+
+/// 底噪垫开关（成品链路最后一道地板保护）。默认开。
+///
+/// 相关门与底噪门串联时安静段会被压到 16bit 量化以下，成品里出现 0.3~0.5s
+/// 的**纯数字静音**（频谱上的竖直断口）。这一层只把被压穿的帧补回「本该有的
+/// 底噪电平」，语音帧不动。用 `--dart-define=COMFORT_NOISE=false` 做 A/B。
+const bool kComfortNoise =
+    String.fromEnvironment('COMFORT_NOISE', defaultValue: 'true') == 'true';
 
 /// 采集侧啸叫陷波开关。默认开。
 ///
@@ -141,6 +150,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
     final NoiseGate? noiseGateOut =
         kNoiseGate ? NoiseGate(sampleRate: kSampleRateRecorder) : null;
 
+    // 地板保护：只补成品，不补上行（上行垫噪声等于对对方放嘶声）。
+    final ComfortNoise? comfort =
+        kComfortNoise ? ComfortNoise() : null;
+
     await for (final message in workerReceivePort) {
       if (message is! Map) continue;
       final String type = message['type'];
@@ -203,6 +216,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
             notch?.reset();
             noiseGate?.reset();
             noiseGateOut?.reset();
+            comfort?.reset();
 
             final String? filePath = message['filePath'];
             if (filePath != null && filePath.isNotEmpty) {
@@ -295,12 +309,20 @@ void audioProcessingWorker(SendPort mainSendPort) {
             // 下行相关门：给落盘成品用的那一份（上行不经过它 ——
             // 对讲时把对方声音整段压掉会让对讲变成半双工，成品干净就够了）。
             // 判决基于未被底噪门压过的真实能量；底噪门在相关门**之后**
-            // 作用于成品，顺序与文档一致：AEC→陷波→相关门→底噪门→落盘。
+            // 作用于成品，顺序与文档一致：AEC→陷波→相关门→底噪门→底噪垫→落盘。
             Uint8List outChunk = (gate != null && chunk.isNotEmpty)
                 ? gate.process(chunk)
                 : chunk;
             if (noiseGateOut != null && outChunk.isNotEmpty) {
               outChunk = noiseGateOut.process(outChunk);
+            }
+            // 地板保护：两个门串联后安静段会被压到量化以下（成品里是纯数字
+            // 静音的竖直断口）。按「底噪门本来会留下的电平」把差额补回来。
+            if (comfort != null && outChunk.isNotEmpty) {
+              outChunk = comfort.process(
+                outChunk,
+                noiseGate?.floorDbfs ?? -61.0,
+              );
             }
 
             // =================== 1. 文件写入（成品：AEC 后的 48k pcm）===================
@@ -359,6 +381,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
             gate?.reset();
             noiseGate?.reset();
             noiseGateOut?.reset();
+            comfort?.reset();
             break;
 
           case 'howl_notch':
