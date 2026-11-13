@@ -525,7 +525,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   ///   判据在 1.9↔2.2kHz 跳频下永远攒不够计数，25s 才锁上一次）；
   /// - 峰频落在 [notchMinHz] ~ [notchMaxHz]（**下限 1200Hz 是硬约束**：
   ///   人声基频 80~400Hz、低次谐波 400~1200Hz 全在下面，挖了就是把人说话
-  ///   挖空；实测啸叫在 1.5~3.8kHz）；
+  ///   挖空；实测啸叫 1.5~3.8kHz，裸麦宽带回环另有一段 5.4~7.9kHz）；
   /// - 采集电平 > -35dBFS：静音期的残余回声（-44dBFS）不配锁频，
   ///   旧版曾在安静段把 1406Hz 残响锁成啸叫；
   /// - 同一频点 ±[mergeHz] 内不重复挖，最多同时挖 3 个；
@@ -537,7 +537,10 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   static const int maxTargets = 3;
   static const int staleMs = 6000;
   static const double notchMinHz = 1200.0;
-  static const double notchMaxHz = 6000.0;
+
+  /// 上限 9kHz：2026-11-13 宽带回环实测自激在 5.4k / 7.9kHz，
+  /// 旧的 6k 边界把 7.9k 挡在外面（守卫侧搜索上限同步抬到 9k）。
+  static const double notchMaxHz = 9000.0;
 
   void _startNotchDetector() {
     _stopNotchDetector();

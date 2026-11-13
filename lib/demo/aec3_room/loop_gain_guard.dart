@@ -120,7 +120,14 @@ class LoopGainGuard {
   static const int fftSize = 1024; // 21.3ms @48k
   static const int hopSize = 512; // 10.7ms 一帧，50% 重叠
   static const int lowBin = 4; // ~187Hz（Q 的邻带统计从这里起）
-  static const int highBin = 86; // ~4.0kHz
+
+  /// **峰值搜索/邻带统计的上限**：~9.0kHz（192 × 46.875）。
+  ///
+  /// 2026-11-13 真机宽带回环实测：SYS_3A 关掉后环路自激落在 5.4k / 7.9kHz
+  /// （两份成品同一墙钟时刻都有窄峰），原先 4kHz 的上限让守卫永远看不到它，
+  /// 陷波目标一次都没锁上。上限抬到 9k 后语音段仍然只按最大峰判（元音谐波
+  /// 2~3k 占优），齿音 5~8k 是宽带、Q 低，不会误判。
+  static const int highBin = 192; // ~9.0kHz
 
   /// **峰值搜索的下限**：~1.2kHz。
   ///
@@ -317,7 +324,7 @@ class LoopGainGuard {
     final double peakDbfs =
         20 * _log10(4.0 * math.sqrt(peak) / fftSize + 1e-20);
 
-    // 邻带（跳过峰附近 ±2 bin），与峰搜索同区间（1.2~4kHz）。
+    // 邻带（跳过峰附近 ±2 bin），与峰搜索同区间（1.2~9kHz）。
     // 若把低频也算进邻带，人声基频的大能量会把 Q 稀释掉，真啸叫反而漏判。
     double nbSum = 0;
     int nbCount = 0;
