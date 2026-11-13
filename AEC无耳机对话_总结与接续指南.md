@@ -1,6 +1,17 @@
 # AEC 无耳机对话 · 项目总结与接续指南
 
-> 换账号接续用。读完这份就能无缝接手，不必重跑历史验证。
+> 换账号/换机器接续用。读完这份就能无缝接手，不必重跑历史验证。
+>
+> **2026-11-13 换地方开发 · 最短上手路径**
+> 1. 读第十节（分支/提交现状：默认分支 `main`，当前 `5c0d3da`）；
+> 2. 读第二节（文件清单，含本轮新增 `comfort_noise.dart`）；
+> 3. 读第五节（现在该做什么）与第六节（出包命令，Android 用 `--profile`）；
+> 4. 读第二十节（本轮「频谱断裂」根因/修复/诊断三件套，**下手前必读**）；
+> 5. 分析成品：`python3 tool/analyze_product_health.py <wav...>`。
+>
+> 硬约束：① 成品 bar = 48k 全频带 + 只本端 + 自然底噪 + 无啸叫；② 严禁装第三方
+> 原生包；③ 本机 7891 代理是坏的，git/curl 必须绕开（第七节）；④ token 在
+> `~/.git-credentials`，只进变量，严禁打印。
 
 ## 一、这个项目在做什么
 
@@ -15,22 +26,31 @@
 
 ```
 lib/demo/aec3_room/
-├── handsfree_room_page.dart        # 唯一实测动线页（进房→对讲→导出WAV+分享）
-├── audio_processing_worker.dart    # worker isolate：48k采集→AEC3→落盘pcm / 编码opus
+├── handsfree_room_page.dart        # 唯一实测动线页（进房→对讲→导出WAV+分享+诊断落盘）
+├── audio_processing_worker.dart    # worker isolate：48k采集→AEC3→门链→底噪垫→落盘/编码
 ├── audio_playback_manager.dart     # 播放 + 参考信号回喂 + duck
-├── loop_gain_guard.dart            # 采集侧啸叫守卫 + 环路增益守卫
-├── delay_calibrator.dart           # 参考延迟自动标定（31位LCG长周期PN）
-├── residual_gate.dart              # 下行相关门（成品彻底无回声）
+├── loop_gain_guard.dart            # 采集侧啸叫守卫（1.2~9kHz）+ 环路增益守卫
+├── howl_notch.dart                 # 二阶陷波组：页面检出啸叫频点后下发
+├── residual_gate.dart              # 下行相关门（自搜延迟，成品彻底无回声）
+├── noise_gate.dart                 # 采集侧底噪门（谷值追踪噪底，成品只留本端）
+├── comfort_noise.dart              # 底噪垫（只补差额，防门链串联把成品压成数字静音）
 ├── room_socket.dart                # 房间 WS 通信
 ├── wav_export.dart                 # 流式 pcm→wav
+├── e2e_selftest_page.dart          # AEC3 端到端自检页（离线断言用）
 └── dual_room_page.dart             # 旧调试页（有参考未对齐问题，别用）
 packages/native_aec/
 ├── src/aec3_bridge.cpp             # C++ 桥接：AEC3 + 高频旁路（线性相位FIR）
 └── lib/native_aec.dart             # Dart FFI 壳
 tool/
-├── analyze_echo.py / analyze_spectrum.py / analyze_howling.py
+├── analyze_echo.py                 # 回声/延迟互相关（numpy）
+├── analyze_spectrum.py             # 长时平均频谱 / 频段电平（numpy）
+├── analyze_product_health.py       # 成品健康检查：数字静音断口 + 持续性窄带坑（纯 stdlib）
+├── aec3_offline.dart               # 纯 Dart 离线跑 AEC3 链路
 └── relay_server.dart               # 零依赖中继（仅本地验证用，实测走生产服务端）
 ```
+
+> `delay_calibrator.dart` 已在 UI 精简提交 `efd6cb4` 中删除（参考延迟改由相关门
+> 自己搜，标定功能冗余）。
 
 `lib/main.dart` 首页第一个按钮进实测页；`ROOM_TEST` / `AEC3_E2E` 用 `String.fromEnvironment(...)=='true'` 判断。
 
@@ -67,23 +87,38 @@ TRTC 手机端不关硬件 3A、动态对齐、AEC 后还有 NLP 残留抑制、
 + `modeNormal` + `autoGain/echoCancel/noiseSuppress: false` + `contentType: music`），
 只剩单层 AEC3。**TRTC 做的是「全带 3A」，不是「关 3A 换带宽」**。
 
-### 5. 三个 dart-define 开关（都用 String.fromEnvironment）
+### 5. dart-define 开关（全部用 String.fromEnvironment，默认值写在代码里）
 | 开关 | 默认 | 作用 |
 |---|---|---|
 | `FULLBAND` | true | 高频旁路，成品 8kHz 以上原样取采集 |
 | `RESIDUAL_GATE` | true | 下行相关门，成品彻底无回声 |
-| `KEEP_RAW` | true | 额外落 AEC 前 `_raw.pcm`，离线算真实 ERLE |
+| `RESIDUAL_GATE_DTLK` | true | 双讲保护（双讲时少压，保护本端） |
+| `NOISE_GATE` | true | 采集侧底噪门（谷值追踪噪底） |
+| `COMFORT_NOISE` | true | 底噪垫（只补差额）；`false` 可复现「频谱断裂」对照 |
+| `HOWL_NOTCH` | true | 采集侧陷波组（1.5kHz 以上频点） |
+| `KEEP_RAW` | true | 额外落 `_raw.pcm` / `_ref.pcm` / `_stats.log`，离线算真实 ERLE |
+| `UPSTREAM_AGC` | false | 上行 AGC（默认关：会在啸叫回路里把振荡托稳） |
+| `SYS_3A` / `SYS_3A_DUAL` | false | 系统 3A（关：与 AEC3 串联会双处理） |
+| `PIN_MIC` | false | 采集钉住单一麦克风（排查换麦导致的音色跳变） |
 
 ## 五、待办（接手后按顺序做）
 
-1. **双端出包重测**：提交 `96e266f` 已推送，但还**没出包**。GitHub 打 iOS IPA、
-   本机打 Android APK 装真机（命令见下）。
-2. **真机调 residual_gate 阈值**：`rhoFull=0.55` 是合成信号标定，真机 AEC 已消大部分
-   线性回声，残余 ρ 可能偏低。若「对方单独说话还有残响」→ 把 `rhoNone` 降到 0.1、
-   `rhoFull` 降到 0.4 更激进。
-3. **测 iOS 真实延迟**：用页面「标定延迟」按钮实测，替代猜测的 100ms。
-4. **两端 wav + raw 都留**，发回来做互相关算真实 ERLE 和 20kHz 恢复量。
-5. 未验证：loop_gain_guard / delay_calibrator 的**真机行为**（只做了纯 Dart 逻辑验证）。
+> 2026-11-13 第五轮收尾时的真实状态。旧的「先去出包/调 rhoFull」已完成，别重跑。
+
+1. **双端跑一轮 KEEP_RAW 录制**（Android 已装 `main@5c0d3da`；iPhone 待连上装 IPA，
+   见第六节）。每端至少：安静 5s → 对讲 20s → 再安静 5s；中间让对方说整句、
+   本端说整句，最好制造一次同时说话（双讲）。
+2. **拉回三件套算 ERLE**：`_raw.pcm`（AEC 前）、`_ref.pcm`（AEC 实际参考）、
+   `_stats.log`（每秒一行）。用互相关找真实回声延迟，用 in/out 差估 ERLE。
+   这一步是回答「用户说的回音到底在成品里，还是本地播放出来的」的唯一硬证据。
+3. **先跑 `tool/analyze_product_health.py`** 看成品有没有 >=5ms 连续零采样
+   （本轮修的断裂是否真的消失），再看长时平均频谱有没有持续性窄带坑。
+4. **听感确认底噪垫的量**：`COMFORT_NOISE=false/true` 各录一条对比。垫高了会
+   变「沙沙响」，垫低了断裂会回来（见第二十节）。
+5. **服务端延迟（Tier 2）不解决，门的压制上限就是对话天花板**：audiowss 单向
+   2~3.6s。这个不是 App 侧能修的，但每次分析成品都要把它当成第一嫌疑。
+6. 仍未验证：`loop_gain_guard` / `howl_notch` 的真机长期行为（只做了纯 Dart +
+   离线录音验证）。
 
 ## 六、出包命令（照抄）
 
@@ -94,29 +129,35 @@ export TMPDIR=/home/ycwork/project/zyxc/codec/app/download/ios-test/.workbuddy/t
 mkdir -p "$TMPDIR"
 env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
   GRADLE_USER_HOME=/home/ycwork/.gradle \
-  /home/ycwork/software/flutter/bin/flutter build apk --debug \
+  /home/ycwork/software/flutter/bin/flutter build apk --profile \
   --dart-define=ROOM_TEST=true --dart-define=ROOM_ID=aec3test \
   --dart-define=KEEP_RAW=true
 adb uninstall com.example.my_flutter_app   # 必须先卸（CI keystore 与本机不同，否则签名冲突）
-adb install -r build/app/outputs/flutter-apk/app-debug.apk
+adb install -r build/app/outputs/flutter-apk/app-profile.apk
 ```
+> 真机测音频一律用 `--profile`：`--debug` 的 JIT 抖动会让采集/播放回调掉帧，
+> 表现出来的「杂音」是打包方式造成的，不是算法。只有排查 Dart 异常才用 `--debug`。
 
 ### iOS（GitHub Actions 打 IPA）
 ```bash
+# 本机 7891 代理是坏的（curl 000），API 必须 --noproxy。token 只进变量，别打印
 TOKEN=$(grep -o 'https://[^:]*:[^@]*@github\.com' ~/.git-credentials | head -1 | sed 's#https://[^:]*:##; s#@github\.com##')
-curl -X POST -H "Authorization: Bearer $TOKEN" \
+curl --noproxy '*' -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" \
   https://api.github.com/repos/Will-yc/ios-test/actions/workflows/ios-release.yml/dispatches \
   -d '{"ref":"main"}'
-# 等 5 分钟，查 run id 后下载 artifact zip 解压得到 my_flutter_app.ipa
+# 约 5 分钟后按 commit 查 run：
+curl --noproxy '*' -H "Authorization: Bearer $TOKEN" \
+  "https://api.github.com/repos/Will-yc/ios-test/actions/runs?per_page=5" | grep -E 'run_number|head_sha|status|conclusion'
+# 再下 artifact iOS-IPA-room-test（zip 里是 my_flutter_app.ipa）
 ```
 
 ### iOS 装真机（pymobiledevice3）
 ```bash
-sudo systemctl start usbmuxd   # 若 usbmuxd inactive
+sudo systemctl start usbmuxd          # 若 usbmuxd inactive
 source ~/.venv/mobile/bin/activate
-python -m pymobiledevice3 usbmux list
-python -m pymobiledevice3 apps install /home/ycwork/Downloads/ios-ipa-fullband/my_flutter_app.ipa
+python -m pymobiledevice3 usbmux list # 必须先看到设备 UDID，否则后面全失败
+python -m pymobiledevice3 apps install /tmp/ios_ipa_5c0d3da/my_flutter_app.ipa
 python -m pymobiledevice3 syslog live | grep -i flutter
 ```
 
@@ -130,31 +171,76 @@ python -m pymobiledevice3 syslog live | grep -i flutter
 
 ## 八、拉回真机录音分析
 
+### 8.1 产物说明（KEEP_RAW=true 时同目录一次落四份）
+| 文件 | 内容 |
+|---|---|
+| `handsfree_X_时间.wav` / `.pcm` | **成品**（门链 + 底噪垫之后，真正会播给对方/分享的） |
+| `handsfree_X_时间_raw.pcm` | AEC **之前**的采集（含回声、底噪） |
+| `handsfree_X_时间_ref.pcm` | AEC **实际喂进去的参考**（播放缓冲那一份，不是网络收到的原始包） |
+| `handsfree_X_时间_stats.log` | 每秒一行：`t= in= out= lag= rho= floor= notch= vote= peak= duck= frames= starved=` |
+
+全部 48k / 单声道 / int16-LE。
+
+### 8.2 Android（adb）
 ```bash
-# Android（raw 是 AEC 前、不带 raw 的是成品，都是 48k/单声道/int16）
 adb exec-out run-as com.example.my_flutter_app ls -la app_flutter/
 adb exec-out run-as com.example.my_flutter_app cat app_flutter/<文件名> > <本地>
-
-# 分析脚本（numpy，venv 在 /home/ycwork/.workbuddy/binaries/python/envs/default）
-/home/ycwork/.workbuddy/binaries/python/envs/default/bin/python tool/analyze_howling.py raw.pcm out.pcm
 ```
 
-**iOS 拉录音的坑**：当前 IPA 的 Info.plist **缺 `UIFileSharingEnabled`**，
-`apps afc --documents` 报 InstallationLookupFailed，拉不到 iOS 端文件。
-要做两端互相关得先加文件共享再出包。
+### 8.3 iOS（pymobiledevice3，文件共享已开）
+`ios/Runner/Info.plist` 已含 `UIFileSharingEnabled` + `LSSupportsOpeningDocumentsInPlace`
+= true，所以 `--documents` 能进沙盒。`apps afc` 是**交互式 shell**（不是一次性命令）：
+```bash
+source ~/.venv/mobile/bin/activate
+python -m pymobiledevice3 apps afc --documents com.zhiyuexctest.app
+# 进去以后：
+ls
+pull handsfree_A_20261113_162048.pcm      ./a.pcm
+pull handsfree_A_20261113_162048_stats.log ./a_stats.log
+# 也支持 cat / rm / stat / walk / pwd / cd
+```
+> `InstallationLookupFailed` 只说明「这台设备上没装该 bundle id」。iOS 端 id 是
+> `com.zhiyuexctest.app`（Android 是 `com.example.my_flutter_app`，两者不同），
+> 装完 main 版 IPA 再拉。
 
-## 九、两个已知真 Bug（还没修）
+### 8.4 分析
+```bash
+python3 tool/analyze_product_health.py <成品.wav> [<成品2.wav> ...]   # 纯 stdlib，无需 numpy
+# 输出：① >=5ms 连续零采样断口（含前后 100ms 电平）② 长时平均频谱里 >12dB 的持续性窄带坑
+#       ③ 11 个频段（300~20000Hz）的语音帧电平
+/home/ycwork/.workbuddy/binaries/python/envs/default/bin/python tool/analyze_echo.py <成品.wav> <raw.pcm>
+/home/ycwork/.workbuddy/binaries/python/envs/default/bin/python tool/analyze_spectrum.py <raw.pcm> <成品.pcm>
+```
+> 判读铁律：**间歇性陷波/抑制只能看 `_stats.log` 的 `notch=` / `lag=` / `rho=`**；
+> 用「逐帧逐 bin 跟邻域比」找坑会有 ~50% 误报（语音谷被当成坑）。长时平均频谱
+> 只用来判「**持续**」的坑。
 
-1. **粘包**：`room_socket.dart:136` 直接 `jsonDecode(data)`，服务端把 `leave`+`join`
-   塞进同一帧 → `FormatException` → 整帧两条消息全丢，成员进出状态错乱。
-2. **iOS 文件共享**：见上，Info.plist 缺 `UIFileSharingEnabled`。
+## 九、已知真 Bug
+
+1. **粘包/多 JSON 单帧**：`room_socket.dart` 的 `jsonDecode(data)` 一次只解一个对象。
+   服务端若把 `leave`+`join` 塞进同一帧，`jsonDecode` 抛 `FormatException`，整帧
+   两条消息都丢（现在有 try/catch，不再崩，但成员状态仍会错乱）。修法：先尝试
+   整体解析，失败则按 `}{` 边界切分再逐条解析。**未修**。
+2. ~~iOS 文件共享~~ **已修**：`Info.plist` 已加 `UIFileSharingEnabled` +
+   `LSSupportsOpeningDocumentsInPlace`，`apps afc --documents` 可用（见 8.3）。
 
 ## 十、仓库当前状态
 
-- 最新提交 `96e266f`（本地 = 远程 `origin/main`），已推送。
-- 分支 `main`，工作区干净（无未提交改动）。
-- 历史提交：`4ebc39f`(全频带) → `8ff23f7`(啸叫分平台延迟) → `ee95e43`(参考对齐+去削波)
+- **默认分支是 `main`（这个仓库没有 `master`）**。2026-11-13 已把第五轮修复合并到
+  `main`，最新提交 `5c0d3da`（`fix(aec): 把 9k 陷波/诊断轨/底噪垫同步到 main`）。
+- 另一条独立线 `test-bd2c408`（分支独有 `641c88a` → `cbaea64` → `62c5ca2` → `536d804`）
+  与 main **结构不同**：那边相关门是 464 行精简版、上行不经过相关门；main 这边
+  相关门是 725 行版（`rhoFull 0.28 / rhoNone 0.06 / doubleTalkGuard / refLacking`），
+  且 **上行也要过相关门**（`upChunk = noiseGate.process(gated)`）。移植改动时不能
+  照搬行号，要按语义落。
+- main 近期脉络（新→旧）：
+  `5c0d3da`(9k陷波/三件套诊断/底噪垫) → `efd6cb4`(UI 精简) →
+  `cb87013`(恢复自搜门) → `9e324cd`(NLP 实验) → `0c91b1d`(门不回退) →
+  `c7831aa`(回退到好基线) → `81f3c61`(文档) → `cc76ff0`(hardSync) →
+  `30eddf2`(TRTC 机制) → `50178fc`(iOS 裸麦+门接上行)。
+- 历史更早：`4ebc39f`(全频带) → `8ff23f7`(啸叫分平台延迟) → `ee95e43`(参考对齐+去削波)
   → `7832567`(实测页) → `7660e59`(AEC3 集成) → `9515f94`。
+- 推送必须绕开本机坏代理（见第七节）。
 
 ## 十一、2026-11-12 复测：两台设备**不在同一空间**仍啸叫 → 采集侧陷波（新增层）
 
@@ -741,3 +827,111 @@ setFeedThreshold/setFeedCallback/start/release），native 缓冲清不掉。但
 - **调小/调大阈值**：100ms native（不可 flush 的下限）+ 500ms 总上限已是
   「贴近 live」与「抗抖动」的折中；服务端延迟主导，再调边际无感。
 - **trim 保留部分旧缓冲**：与「只播最新」目标相悖（清全部 = 只留最新，最优）。
+
+## 二十、2026-11-13 第五轮：成品「频谱断裂」= 门链串联成 −53dB 数字静音（已修）
+
+> 这一节是**换地方开发后最先要读的**：解释了为什么之前的成品会出现大片「断掉」
+> 的段落，以及为什么不要再用「逐帧频谱挖坑」那套指标下结论。
+
+### 20.1 用户反馈与本轮目标
+- 前一轮反馈是「有杂音，也有回音」；装 `641c88a`（双流诊断线）后变成
+  **「出现了频谱断裂情况了，数据也不行」** —— 听感是句子中间突然静音，像信号丢了。
+- 本轮只做一件事：**把断裂的真实根因量化并修掉，不做任何阈值玄学**。
+
+### 20.2 量化证据（真机成品，不是推测）
+分析对象：`~/Downloads/audio/test/handsfree_A_20261113_162048_android .wav`
+（48.56s，注意文件名末尾有个空格）与 `handsfree_B_20261113_162051(1).wav`（45.00s）。
+
+| 指标 | A（断裂） | B（正常） |
+|---|---|---|
+| ≥5ms 连续零采样段 | **32 段，合计 0.77s** | **0 段** |
+| 主断口位置 | 7.009–7.36s、12.076–12.25s | — |
+| 断口前后电平 | −54 → −70 → −83 → −99 → **−113dBFS**，平滑指数衰减，然后突然恢复 | — |
+| 持续性窄带坑（长时平均频谱 −12dB） | 无（最大单 bin 偏差 19.5%，全是语音谷） | 无 |
+| 8kHz 分界带 | 7750/8000/8250Hz = 33/32/33dB，连续 | 35/34/37dB，连续 |
+| 10~20kHz | 频段电平平滑过渡，无缺失 | 同 |
+
+**排除**：不是陷波挖坑、不是 8k 分带断裂、不是高频旁路缺失。断口的形状
+（平滑衰减到底再突然恢复）是**数字静音**，不是滤波。
+
+### 20.3 根因（纯算术，可复核）
+成品链下游串联了两个门，最坏情况增益相乘：
+
+```
+ResidualGate.gFloor = 0.02   → −34.0dB
+NoiseGate.minGain   = 0.11   → −19.0dB
+合计                         → −53.0dB
+```
+
+安静期房间底噪实测 ≈ **18 LSB**（约 −65dBFS）。18 × 0.02 × 0.11 = **0.0396 LSB**
+→ int16 取整 **= 0**。整帧全是 0，就是听到的「断裂」。
+只要两门同时压在底（远端静音 + 本端静音的交界处最容易同时发生），
+就会连续输出零采样；B 端房间更吵（底噪更高）所以从未触发。
+
+### 20.4 修复：底噪垫 `comfort_noise.dart`（只补差额，不新开一层门）
+设计原则：**成品允许有自然底噪，但绝不允许是数字零**。
+
+- 目标电平：`target = 锚点 − 19dB`，夹在 `[−84, −60] dBFS`。
+  −19dB 恰好等于底噪门在静音帧留下的增益，听感与「门正常工作时的安静期」一致。
+- 锚点：**门之前**那帧的 RMS（`frameDbfs(chunk)`），自己用最小值跟踪器：
+  瞬时下降、每帧最多 +0.002dB（≈0.2dB/s）上升。这样语音段不会把锚点抬走，
+  也不会被下沉的门电平拖低。
+- 只在 `curRms < targetRms` 时补：`needRms = sqrt(target² − cur²)`，
+  均匀白噪 × `√3` 折算幅度，逐样本加到原信号上。**不衰减原信号**，所以不会
+  再引入第二层乘法。
+- 只作用于**成品路径**（下行给对方/落盘的 outChunk），**上行永不垫**（否则把
+  噪声发给对端）。
+- 开关：`--dart-define=COMFORT_NOISE=false` 可复现旧行为做 A/B。
+
+### 20.5 离线验证（合成 + 真机数据回放）
+- 把 A 的断口段（−54 → −113dBFS）回放进新链：输出最低 **−84.2dBFS**，
+  **零采样段 = 0**；安静期电平分布为 −84/−84/−83dBFS（p10/p50/p90），
+  与「门正常工作的安静期」一致。
+- `dart analyze` 0 issue。
+- 反向确认：`COMFORT_NOISE=false` 时断口原样复现 → 证明是这一层在兜。
+
+### 20.6 同步到 main + 分支处置
+- 仓库**没有 `master`**，默认分支是 `main`。本轮把修复移植到 main（不能照搬
+  行号：main 的上行也过相关门，见第十节），提交 **`5c0d3da`**。
+- `test-bd2c408` 分支保留原样（双流诊断线），**不要**在它上面继续开发。
+- 移植时同时落了：陷波上限 4.0k → **9.0k**（`loop_gain_guard.highBin 192`，
+  真机宽带回环实测落在 5.4k / 7.9kHz）、`_ref.pcm` 参考轨、`_stats.log` 每秒统计。
+
+### 20.7 新增诊断三件套（KEEP_RAW=true）
+| 文件 | 用途 |
+|---|---|
+| `_raw.pcm` | AEC 前采集 → 算真实 ERLE、找回声延迟 |
+| `_ref.pcm` | AEC 实际吃到的参考（播放缓冲那份）→ 与 raw 互相关定位回声 |
+| `_stats.log` | 每秒 `t= in= out= lag= rho= floor= notch= vote= peak= duck= frames= starved=` |
+
+判读要点：
+- `starved%` 高 = 参考断供（采集/播放两时钟不锁定），AEC 再准也没用；
+- `lag` 应≈真实回声延迟（真机实测 321~352ms），`rho` 在远端单讲时应明显升高；
+- `out−in` 近似 ERLE；`notch=` 是页面检出的啸叫频点（间歇性证据只能看这里）。
+
+### 20.8 出包 / 装机状态
+- Android：`main@5c0d3da` **profile** 包（KEEP_RAW=true）已装到 PMA120。
+- iOS：CI run `43398328280` 成功，IPA 在 `/tmp/ios_ipa_5c0d3da/my_flutter_app.ipa`；
+  当时 iPhone 未连（`usbmuxd` 未起），**尚未安装** —— 接手后第一件事就是装上。
+
+### 20.9 仍未解决（别以为修完了）
+1. **「回音」没有被证实**：A/B 两条成品里都检测不到远端语音包络
+   （包络互相关 0.05），说明成品大概率没有对方声音；用户听到的回音更可能是
+   **本地扬声器→麦克风当场听到的**，或者是服务端 2~3.6s 延迟造成的「答非所问」。
+   要定论必须拉 `_raw.pcm` / `_ref.pcm` 算 ERLE 与延迟。
+2. **服务端 `audiowss` 单向 2~3.6s 延迟**仍是天花板（Tier 2），App 侧只能兜底。
+3. 底噪垫的量（−19dB / 下限 −84dBFS）只做了离线与单次真机验证，需要
+   `COMFORT_NOISE` A/B 两条真机录音做最终听感确认。
+
+### 20.10 工具：`tool/analyze_product_health.py`（纯 stdlib）
+```bash
+python3 tool/analyze_product_health.py 成品1.wav 成品2.wav
+```
+输出三块：
+1. **≥5ms 连续零采样断口**（本轮问题的直接判据），附断口前后 100ms 电平；
+2. **长时平均频谱的持续性窄带坑**：以 ±300Hz 平滑谱为参考，中心 ±3 bin 排除，
+   低于参考 12dB 才报；**不报间歇性陷波**（那只能看 `_stats.log`）；
+3. 11 个频段（300~20000Hz）的语音帧电平。
+> 反面教材：曾用「逐帧逐 bin 与邻域比」找坑，在 7.7~8.2kHz 产生 45~59% 误报，
+> 高点名了一个**根本不存在**的 8k 坑（细谱实测 8000Hz 处只低 1~3dB）。
+> 判「有没有坑」一律用长时平均谱 + `_stats.log` 双证据。
