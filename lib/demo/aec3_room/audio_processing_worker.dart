@@ -42,14 +42,6 @@ const bool kHighBandBypass =
 const bool kResidualGate =
     String.fromEnvironment('RESIDUAL_GATE', defaultValue: 'true') == 'true';
 
-/// 相关门双讲保护开关。默认开（对标 TRTC nearend unmute / aivad / NLP 分级）。
-///
-/// 开启后近端 VAD 区分「纯回声」与「双讲」：纯回声硬压、双讲软压保留本端，
-/// 上行不再因压回声变半双工。用 `--dart-define=RESIDUAL_GATE_DTLK=false` 退回
-/// 旧的一刀切硬压做 A/B 对照。
-const bool kDoubleTalkGuard =
-    String.fromEnvironment('RESIDUAL_GATE_DTLK', defaultValue: 'true') == 'true';
-
 /// 采集侧底噪门开关。默认开。
 ///
 /// AEC3 的 NS 被有意关掉（怕改频响），所以**静音期的底噪原样进成品**：
@@ -201,7 +193,6 @@ void audioProcessingWorker(SendPort mainSendPort) {
                 // 与本门要对齐的真实回声延迟（播放缓冲 + 声学，实测 321~352ms）
                 // 不是一回事 —— 这里让门自己搜，assumedDelayMs 只当初始值。
                 assumedDelayMs: 300,
-                doubleTalkGuard: kDoubleTalkGuard,
               );
             } else {
               gate = null;
@@ -413,9 +404,6 @@ void audioProcessingWorker(SendPort mainSendPort) {
               'gateLagMs': gate?.currentLagMs ?? -1,
               'gateRho': gate?.lastRho,
               'gateGain': gate?.currentGain,
-              'gateConverged': gate?.converged ?? true,
-              'gateNearEnd': gate?.lastNearEnd ?? false,
-              'gateRefLack': gate?.refLacking ?? false,
               'noiseFloor': noiseGate?.floorDbfs,
               'noiseGain': noiseGate?.gain,
             });

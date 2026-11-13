@@ -196,7 +196,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
   // 相关门自搜出来的回声延迟与当帧读数（诊断：lag 不合理就说明这层没工作）
   int _gateLagMs = -1;
   double _gateRho = 0;
-  bool _gateConverged = true; // false = 收敛期静音中（冷启动压死下行）
   double _noiseFloorDb = -90;
   // 当前真正在挖的陷波频点
   List<double> _notchHz = const <double>[];
@@ -434,7 +433,6 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
             _aecBytesOut = (message['bytesOut'] as num?)?.toInt() ?? 0;
             _gateLagMs = (message['gateLagMs'] as num?)?.toInt() ?? -1;
             _gateRho = (message['gateRho'] as num?)?.toDouble() ?? 0;
-            _gateConverged = message['gateConverged'] != false;
             _noiseFloorDb = (message['noiseFloor'] as num?)?.toDouble() ?? -90;
           });
           break;
@@ -1587,13 +1585,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
                   : !_residualGate
                   ? '关 · 仅 AEC3'
                   : (_gateLagMs < 0
-                      ? (_gateConverged
-                          ? '开 · 正在搜回声延迟'
-                          : '开 · 收敛期静音中（压死冷启动回声）')
-                      : (_gateConverged
-                          ? '开 · 对齐 $_gateLagMs ms（ρ=${_gateRho.toStringAsFixed(2)}）'
-                          : '开 · 已对齐 $_gateLagMs ms，稳定中…')),
-              ok: _audioInited && _residualGate && _gateConverged && _gateLagMs >= 0,
+                      ? '开 · 正在搜回声延迟'
+                      : '开 · 对齐 $_gateLagMs ms（ρ=${_gateRho.toStringAsFixed(2)}）'),
+              ok: _audioInited && _residualGate && _gateLagMs >= 0,
             ),
             _row(
               '啸叫陷波',

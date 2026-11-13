@@ -23,8 +23,6 @@ void main(List<String> args) {
     exit(2);
   }
   final int refLeadMs = args.length > 3 ? int.parse(args[3]) : 2877;
-  final bool dtlk = args.length > 4 ? args[4] != 'false' : true;
-  final double vadMargin = args.length > 5 ? double.parse(args[5]) : 10.0;
 
   final Uint8List cap = File(args[0]).readAsBytesSync();
   final Uint8List refAll = File(args[1]).readAsBytesSync();
@@ -32,7 +30,7 @@ void main(List<String> args) {
 
   const int frameBytes = 960; // 10ms @48k int16
   const int secBytes = frameBytes * 100;
-  final gate = ResidualGate(doubleTalkGuard: dtlk, vadVoiceMarginDb: vadMargin);
+  final gate = ResidualGate();
 
   int refFedBytes = 0;
   final int nSec = cap.length ~/ secBytes + 1;
@@ -40,8 +38,6 @@ void main(List<String> args) {
   final List<double> outSq = List.filled(nSec, 0);
   final List<int> inN = List.filled(nSec, 0);
   final List<int> lagSec = List.filled(nSec, -1);
-  final List<int> neSec = List.filled(nSec, 0); // 近端 VAD 命中帧数
-  final List<int> frSec = List.filled(nSec, 0); // 总帧数
   final ByteData capBd = ByteData.sublistView(cap);
 
   for (int t = 0; t + frameBytes <= cap.length; t += frameBytes) {
@@ -70,31 +66,25 @@ void main(List<String> args) {
     outSq[s] += so;
     inN[s] += frameBytes ~/ 2;
     lagSec[s] = gate.currentLagMs;
-    frSec[s]++;
-    if (gate.lastNearEnd) neSec[s]++;
   }
 
   double db(double sq, int n) => n == 0
       ? -240.0
       : 20 * math.log(math.sqrt(sq / n) / 32768 + 1e-12) / math.ln10;
 
-  stdout.writeln('双讲保护=${dtlk ? "开" : "关"}  lag 轨迹(每秒): ${lagSec.take(20).toList()} ...');
+  stdout.writeln('lag 轨迹(每秒): ${lagSec.take(20).toList()} ...');
   void win(String label, int a, int b) {
     double si = 0, so = 0;
-    int n = 0, ne = 0, fr = 0;
+    int n = 0;
     for (int s = a; s < b && s < nSec; s++) {
       si += inSq[s];
       so += outSq[s];
       n += inN[s];
-      ne += neSec[s];
-      fr += frSec[s];
     }
     if (n == 0) return;
     final din = db(si, n), dout = db(so, n);
-    final nePct = fr == 0 ? 0.0 : 100.0 * ne / fr;
     stdout.writeln('$label $a~${b}s: in=${din.toStringAsFixed(1)}dB '
-        'out=${dout.toStringAsFixed(1)}dB 压制=${(din - dout).toStringAsFixed(1)}dB '
-        '近端VAD命中=${nePct.toStringAsFixed(0)}%');
+        'out=${dout.toStringAsFixed(1)}dB 压制=${(din - dout).toStringAsFixed(1)}dB');
   }
 
   win('纯回声段', 43, 46);
