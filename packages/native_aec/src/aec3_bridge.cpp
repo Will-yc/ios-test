@@ -18,9 +18,11 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <optional>
 #include <vector>
 
 #include <webrtc/api/audio/builtin_audio_processing_builder.h>
+#include <webrtc/api/audio/echo_canceller3_config.h>
 #include <webrtc/api/environment/environment_factory.h>
 #include <webrtc/api/scoped_refptr.h>
 #include <webrtc/modules/audio_processing/include/audio_processing.h>
@@ -81,12 +83,70 @@ struct SplitFir {
   }
 };
 
+// TRTC 式 NLP 分级（对标 aec_nlp_level / force_nlp_level）。
+//
+// AEC3 的残余抑制（NLP）在 suppressor 里，是**频域、逐子带、由自适应滤波器
+// 的回声估计驱动**的 —— 对齐天然由 AecState 样本级跟踪，不像手写相关门那样
+// 要重新搜延迟、漂移就漏回声。normal_tuning 的 masking 阈值越低，抑制越狠：
+//   enr_transparent：ENR（回声/近端）低于它 → 该子带透明（不压）
+//   enr_suppress   ：ENR 高于它 → 该子带全压
+// 调低这两个值 = 更早、更狠地压残余（成品优先）。
+// nearend_tuning / dominant_nearend_detection 一律保持 WebRTC 默认：双讲时
+// AEC3 自动切到温和档（LF 阈值 1.09/1.1）保护本端人声 —— 这正是相关门做不到
+// 的「分级」，也是 TRTC「纯回声硬压、双讲软压」的同构实现。
+webrtc::EchoCanceller3Config MakeAec3Config(int nlp_level) {
+  using MT = webrtc::EchoCanceller3Config::Suppressor::MaskingThresholds;
+  using Tuning = webrtc::EchoCanceller3Config::Suppressor::Tuning;
+  webrtc::EchoCanceller3Config c;
+  switch (nlp_level) {
+    case 0:  // WebRTC 默认（A/B 基线）
+      c.suppressor.normal_tuning =
+          Tuning(MT(.3f, .4f, .3f), MT(.07f, .1f, .3f), 2.0f, 0.25f);
+      break;
+    case 1:  // 温和
+      c.suppressor.normal_tuning =
+          Tuning(MT(.2f, .3f, .25f), MT(.05f, .08f, .25f), 2.0f, 0.25f);
+      break;
+    case 3:  // 极狠（成品最干净，双讲外可能吃本端齿音）
+      c.suppressor.normal_tuning =
+          Tuning(MT(.1f, .18f, .15f), MT(.03f, .05f, .15f), 2.0f, 0.25f);
+      break;
+    case 2:  // 默认：TRTC 式狠档
+    default:
+      c.suppressor.normal_tuning =
+          Tuning(MT(.15f, .25f, .2f), MT(.04f, .07f, .2f), 2.0f, 0.25f);
+      break;
+  }
+  return c;
+}
+
+// 只开 AEC（NS/AGC/HPF 全关，成品要原始频响与真实噪底），注入分级 suppressor。
+webrtc::scoped_refptr<webrtc::AudioProcessing> BuildApm(int sample_rate,
+                                                        int channels,
+                                                        int nlp_level) {
+  webrtc::AudioProcessing::Config config;
+  config.echo_canceller.enabled = true;
+  // 本项目录的是原始人声，不接受 AEC 侧再叠一层高通（会切掉浊音基频）
+  config.echo_canceller.enforce_high_pass_filtering = false;
+  config.noise_suppression.enabled = false;
+  config.gain_controller1.enabled = false;
+  config.gain_controller2.enabled = false;
+  config.high_pass_filter.enabled = false;
+  return webrtc::BuiltinAudioProcessingBuilder(config)
+      .SetEchoCancellerConfig(MakeAec3Config(nlp_level), std::nullopt)
+      .Build(webrtc::CreateEnvironment());
+}
+
 }  // namespace
 
 struct Aec3Bridge {
   webrtc::scoped_refptr<webrtc::AudioProcessing> apm;
   webrtc::StreamConfig stream;
   int frame_samples = AEC3_MAX_FRAME;
+  // 重建 APM（换 NLP 档）时需要原始创建参数
+  int sample_rate = 48000;
+  int channels = 1;
+  int nlp_level = 2;  // 默认 TRTC 式狠档
 
   std::vector<int16_t> pending;  // 未满一帧的采集残留
   std::deque<int16_t> ref;       // 参考信号队列（按样本计）
@@ -114,20 +174,12 @@ Aec3Bridge *aec3_create(int sample_rate, int channels) {
     return nullptr;
   }
 
-  webrtc::AudioProcessing::Config config;
-  config.echo_canceller.enabled = true;
-  // 本项目录的是原始人声，不接受 AEC 侧再叠一层高通（会切掉浊音基频）
-  config.echo_canceller.enforce_high_pass_filtering = false;
-  config.noise_suppression.enabled = false;
-  config.gain_controller1.enabled = false;
-  config.gain_controller2.enabled = false;
-  config.high_pass_filter.enabled = false;
-
   auto *b = new (std::nothrow) Aec3Bridge();
   if (b == nullptr) return nullptr;
 
-  b->apm = webrtc::BuiltinAudioProcessingBuilder(config).Build(
-      webrtc::CreateEnvironment());
+  b->sample_rate = sample_rate;
+  b->channels = channels;
+  b->apm = BuildApm(sample_rate, channels, b->nlp_level);
   if (b->apm == nullptr) {
     delete b;
     return nullptr;
@@ -140,6 +192,29 @@ Aec3Bridge *aec3_create(int sample_rate, int channels) {
 }
 
 void aec3_destroy(Aec3Bridge *b) { delete b; }
+
+// 运行时换 NLP 档（TRTC aec_nlp_level 语义）。EchoCanceller3Config 只能在
+// Build 时注入，没有运行时 ApplyConfig 通路，所以换档 = 重建 APM。重建会清掉
+// 自适应滤波器，必须连同所有跨帧状态一起复位、重新收敛（~1s）。调用方应在
+// 换档后容忍这段收敛期。构建失败则保持旧档，绝不让句柄变空。
+void aec3_set_nlp_level(Aec3Bridge *b, int level) {
+  if (b == nullptr) return;
+  if (level < 0) level = 0;
+  if (level > 3) level = 3;
+  if (level == b->nlp_level && b->apm != nullptr) return;
+  auto apm = BuildApm(b->sample_rate, b->channels, level);
+  if (apm == nullptr) return;
+  b->apm = apm;
+  b->nlp_level = level;
+  b->pending.clear();
+  b->ref.clear();
+  b->raw_hist.clear();
+  b->apm_hist.clear();
+  b->rms_in = 0.0;
+  b->rms_out = 0.0;
+  b->processed_frames = 0;
+  b->starved_frames = 0;
+}
 
 void aec3_set_high_band_bypass(Aec3Bridge *b, int enable) {
   if (b == nullptr) return;
@@ -276,7 +351,7 @@ void aec3_get_stats(Aec3Bridge *b, int *in_db10, int *out_db10,
 }
 
 const char *aec3_build_info(void) {
-  return "webrtc-audio-processing m155.8059.4.0 (AEC3 only, mono, 16/32/48k, fullband-bypass)";
+  return "webrtc-audio-processing m155.8059.4.0 (AEC3 only, mono, 16/32/48k, fullband-bypass, nlp-graded)";
 }
 
 }  // extern "C"

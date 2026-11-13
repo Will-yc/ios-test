@@ -22,6 +22,9 @@ typedef _Aec3HandleOnlyD = void Function(Pointer<Void> handle);
 typedef _Aec3SetFlagC = Void Function(Pointer<Void> handle, Int32 enable);
 typedef _Aec3SetFlagD = void Function(Pointer<Void> handle, int enable);
 
+typedef _Aec3SetNlpC = Void Function(Pointer<Void> handle, Int32 level);
+typedef _Aec3SetNlpD = void Function(Pointer<Void> handle, int level);
+
 typedef _Aec3PushRefC =
     Int32 Function(Pointer<Void> handle, Pointer<Int16> pcm, Int32 samples);
 typedef _Aec3PushRefD =
@@ -77,6 +80,7 @@ class _Aec3Ffi {
     required this.stats,
     required this.version,
     this.setHighBandBypass,
+    this.setNlpLevel,
   });
 
   final _Aec3CreateD create;
@@ -89,6 +93,8 @@ class _Aec3Ffi {
   // 旧版 native 库没有这个符号，缺失时置 null（自动退回旧行为），不能让
   // 整个 FFI 初始化失败 —— 否则录音会连 AEC 一起退化成直通。
   final _Aec3SetFlagD? setHighBandBypass;
+  // 同上：旧库没有 NLP 分级符号时置 null，保持创建时的默认档。
+  final _Aec3SetNlpD? setNlpLevel;
 
   static bool _tried = false;
   static _Aec3Ffi? _instance;
@@ -103,6 +109,14 @@ class _Aec3Ffi {
           .asFunction();
     } catch (_) {
       setFlag = null; // 旧库：保持旧行为
+    }
+    _Aec3SetNlpD? setNlp;
+    try {
+      setNlp = _dylib
+          .lookup<NativeFunction<_Aec3SetNlpC>>('aec3_set_nlp_level')
+          .asFunction();
+    } catch (_) {
+      setNlp = null; // 旧库：保持默认档
     }
     try {
       _instance = _Aec3Ffi(
@@ -128,6 +142,7 @@ class _Aec3Ffi {
             .lookup<NativeFunction<_Aec3VersionC>>('aec3_build_info')
             .asFunction(),
         setHighBandBypass: setFlag,
+        setNlpLevel: setNlp,
       );
     } catch (_) {
       _instance = null;
@@ -182,6 +197,7 @@ class Aec3Processor {
   static Aec3Processor? tryCreate({
     int sampleRate = 48000,
     bool highBandBypass = false,
+    int nlpLevel = 2,
   }) {
     final ffi = _Aec3Ffi.instance;
     if (ffi == null) return null;
@@ -190,6 +206,7 @@ class Aec3Processor {
       if (h == nullptr) return null;
       final proc = Aec3Processor._(ffi, h, sampleRate);
       proc._highBandBypass = proc.setHighBandBypass(highBandBypass);
+      proc.setNlpLevel(nlpLevel);
       return proc;
     } catch (_) {
       return null;
@@ -206,6 +223,21 @@ class Aec3Processor {
     if (_disposed || set == null) return false;
     set(_handle, enable ? 1 : 0);
     return enable && sampleRate == 48000;
+  }
+
+  /// 当前 NLP（残余抑制）档位。0=默认 / 1=温和 / 2=狠 / 3=极狠。
+  int _nlpLevel = 2;
+  int get nlpLevel => _nlpLevel;
+
+  /// 切换 NLP 档（对标 TRTC aec_nlp_level）。返回 native 是否支持并执行。
+  /// 旧库缺符号时返回 false（保持创建时默认档）。换档会重建 APM、重新收敛 ~1s。
+  bool setNlpLevel(int level) {
+    final set = _ffi.setNlpLevel;
+    if (_disposed || set == null) return false;
+    final int clamped = level < 0 ? 0 : (level > 3 ? 3 : level);
+    set(_handle, clamped);
+    _nlpLevel = clamped;
+    return true;
   }
 
   bool get isDisposed => _disposed;

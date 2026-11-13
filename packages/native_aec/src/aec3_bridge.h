@@ -32,6 +32,11 @@ AEC3_EXPORT void aec3_reset(Aec3Bridge *b);
 /// 传 0 关闭（行为与旧版完全一致）。
 AEC3_EXPORT void aec3_set_high_band_bypass(Aec3Bridge *b, int enable);
 
+/// 运行时切换 NLP（残余抑制）档位，对标 TRTC aec_nlp_level。
+/// 0=WebRTC 默认 / 1=温和 / 2=狠（默认）/ 3=极狠。越低档越保守、越高档成品越干净。
+/// 换档会重建 APM（自适应滤波器清零、重新收敛 ~1s），构建失败则保持旧档。
+AEC3_EXPORT void aec3_set_nlp_level(Aec3Bridge *b, int level);
+
 /// 喂入"正在播放给扬声器"的参考 PCM（int16 交错）。
 /// 必须与 aec3_process_capture 使用同一采样率、同一时间轴。
 /// 返回累计可用的参考样本数（供调用方观测是否供数不足）。

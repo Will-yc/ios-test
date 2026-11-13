@@ -7,7 +7,6 @@ import 'package:my_flutter_app/demo/util/my_dual_resampler_rate.dart';
 import 'package:native_aec/native_aec.dart';
 import 'package:my_flutter_app/demo/aec3_room/howl_notch.dart';
 import 'package:my_flutter_app/demo/aec3_room/noise_gate.dart';
-import 'package:my_flutter_app/demo/aec3_room/residual_gate.dart';
 import 'package:opus_ffi/opus_ffi.dart';
 
 /// 采集采样率：48k 原始字节直接落盘（成品 .pcm 就是这个）。
@@ -30,25 +29,26 @@ const int kSampleRateUplink = 16000;
 const bool kHighBandBypass =
     String.fromEnvironment('FULLBAND', defaultValue: 'true') == 'true';
 
-/// 下行相关门（成品彻底无回声）开关。默认开。
+/// AEC3 残余抑制（NLP）档位。默认 2（TRTC 式狠档）。
 ///
-/// AEC3 按比例消回声，双讲时会漏掉远端残余 + 厂商音效非线性，成品里仍能
-/// 听到「对方的声音」。开启后，凡「与下行参考高度相关的帧」整帧压低到接近
-/// 静音，代价是双讲（双方同时说）时本端也被压低 —— 成品优先的取舍。
-/// **上行同样过门**（2026-11-12 起）：真机实测网络单向延迟高达 2~3s，
-/// AEC3 追不上，上行不过门时远端声音被原样回传 —— 对端一直听到自己的
-/// 回声，且网络环路对啸叫常开。门用本地播放参考判决，不受网络延迟影响。
-/// 用 `--dart-define=RESIDUAL_GATE=false` 可退回纯 AEC3 行为做对照。
-const bool kResidualGate =
-    String.fromEnvironment('RESIDUAL_GATE', defaultValue: 'true') == 'true';
-
-/// 相关门双讲保护开关。默认开（对标 TRTC nearend unmute / aivad / NLP 分级）。
-///
-/// 开启后近端 VAD 区分「纯回声」与「双讲」：纯回声硬压、双讲软压保留本端，
-/// 上行不再因压回声变半双工。用 `--dart-define=RESIDUAL_GATE_DTLK=false` 退回
-/// 旧的一刀切硬压做 A/B 对照。
-const bool kDoubleTalkGuard =
-    String.fromEnvironment('RESIDUAL_GATE_DTLK', defaultValue: 'true') == 'true';
+/// 取代旧的手写「下行相关门」：AEC3 自带的 suppressor 是频域、逐子带、由自适应
+/// 滤波器的回声估计驱动的残余抑制，对齐由 AecState 样本级跟踪 —— 不像相关门那样
+/// 要重新搜延迟、漂移就漏回声、整帧标量增益还抽吸底噪。对标 TRTC aec_nlp_level：
+///   0 = WebRTC 默认（A/B 基线）
+///   1 = 温和
+///   2 = 狠（默认，成品优先）
+///   3 = 极狠（成品最干净，双讲外可能吃本端齿音）
+/// 双讲保护由 AEC3 的 nearend_tuning + DominantNearendDetector 自动完成（保持默认）。
+/// 用 `--dart-define=NLP_LEVEL=0..3` 改默认档；页面上也可实时切换（换档重收敛 ~1s）。
+const String _kNlpLevelStr =
+    String.fromEnvironment('NLP_LEVEL', defaultValue: '2');
+const int kNlpLevel = _kNlpLevelStr == '0'
+    ? 0
+    : _kNlpLevelStr == '1'
+        ? 1
+        : _kNlpLevelStr == '3'
+            ? 3
+            : 2;
 
 /// 采集侧底噪门开关。默认开。
 ///
@@ -91,11 +91,12 @@ const bool kUpstreamAgc =
 /// 移植自 `zyxc-record-app/lib/module/chat/audio/my_dual_audio_processing_worker.dart`，
 /// 只保留「验证 AEC3 无耳机」需要的那部分链路：
 ///
-///   mic(48k) → AEC3(48k) → 啸叫陷波 → 相关门（上行/成品共用）
+///   mic(48k) → AEC3(48k，含分级 NLP 残余抑制) → 啸叫陷波
 ///       ─┬─→ 底噪门 → .pcm 落盘（成品，48k 全频带）
 ///        └─→ 底噪门 → 48k→16k → opus(20ms) → WS 二进制
 ///
-/// 原工程的转码/上传/元数据/sidecar 分支全部去掉 —— 本工程只验证外放 AEC。
+/// 回声抑制全部交给 AEC3 自带的频域 suppressor（对标 TRTC aec_nlp_level），
+/// 不再叠手写时域相关门。原工程的转码/上传/元数据/sidecar 分支全部去掉。
 void audioProcessingWorker(SendPort mainSendPort) {
   final workerReceivePort = ReceivePort();
   mainSendPort.send(workerReceivePort.sendPort);
@@ -134,15 +135,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
         ? HowlNotch(sampleRate: kSampleRateRecorder)
         : null;
 
-    // 外放回声消除（WebRTC AEC3）。null = 直通（未启用或库不可用）。
+    // 外放回声消除（WebRTC AEC3，含分级 NLP 残余抑制）。null = 直通。
     Aec3Processor? aec;
 
-    // 下行相关门（AEC 之后的「宁可错杀」清尾层）。上行与成品共用一份判决：
-    // 成品要干净，上行也不能把 AEC3 没消掉的残余回传给对端（网络单向延迟
-    // 2~3s，残余回传 = 对端听到自己回声 + 啸叫环路常开）。开关 RESIDUAL_GATE。
-    ResidualGate? gate;
-
-    // 采集侧底噪门（AEC + 陷波 + 相关门之后）。上行一份、成品一份：
+    // 采集侧底噪门（AEC + 陷波之后）。上行一份、成品一份：
     // 两个独立实例（各自维护噪底/增益状态），互不串状态。
     // 旧版只把底噪门接在上行，落盘成品绕过了它 —— 真机成品静音期
     // 只压了 1.7dB（应 ~19dB），就是这条旁路造成的。
@@ -183,6 +179,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
               aec ??= Aec3Processor.tryCreate(
                 sampleRate: kSampleRateRecorder,
                 highBandBypass: kHighBandBypass,
+                nlpLevel: kNlpLevel,
               );
               aec?.reset();
               if (aec == null) {
@@ -193,20 +190,6 @@ void audioProcessingWorker(SendPort mainSendPort) {
               aec = null;
             }
 
-            // 下行相关门：默认开（成品彻底无回声）。--dart-define=RESIDUAL_GATE=false 可关。
-            if (kResidualGate) {
-              gate ??= ResidualGate(
-                sampleRate: kSampleRateRecorder,
-                // 页面侧 REF_DELAY 只是给 AEC3 用的「较小延迟」，
-                // 与本门要对齐的真实回声延迟（播放缓冲 + 声学，实测 321~352ms）
-                // 不是一回事 —— 这里让门自己搜，assumedDelayMs 只当初始值。
-                assumedDelayMs: 300,
-                doubleTalkGuard: kDoubleTalkGuard,
-              );
-            } else {
-              gate = null;
-            }
-            gate?.reset();
             // 陷波器跨分段保留会带着上一段的振荡状态，这里一并清掉
             notch?.reset();
             noiseGate?.reset();
@@ -230,7 +213,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
             mainSendPort.send({
               'type': 'init-over',
               'highBandBypass': aec?.highBandBypassEnabled ?? false,
-              'residualGate': gate != null,
+              'nlpLevel': aec?.nlpLevel ?? kNlpLevel,
               'howlNotch': notch != null,
               'noiseGate': noiseGate != null,
               'upstreamAgc': upstreamAgc != null,
@@ -285,24 +268,14 @@ void audioProcessingWorker(SendPort mainSendPort) {
               chunk = notch.process(chunk);
             }
 
-            // 下行相关门：一次判决，上行与成品两条路共用。判决基于未被
-            // 底噪门压过的真实能量（否则弱语音会被「能量远低于参考」兜底
-            // 误判成残余，整句被砍）。**上行必须过门**：真机实测网络单向
-            // 延迟 2~3s，AEC3 消不掉的下行残余若不经门直接回传，对端就一直
-            // 听到自己的回声，且网络环路对啸叫常开。门用本地播放参考判决，
-            // 不受网络延迟影响。代价是双讲时上行也被部分压低 —— 延迟已是
-            // 秒级、对话本就轮流说，可接受；成品干净优先。
-            final Uint8List gated = (gate != null && chunk.isNotEmpty)
-                ? gate.process(chunk)
-                : chunk;
-
             // 底噪门：只压「明显不像语音」的帧（静音期嗡鸣 / 高频嘶声）。
-            // 上行与成品各一个独立实例，互不串状态。
-            // 链路顺序：AEC→陷波→相关门→底噪门→(上行编码 / 落盘)。
-            final Uint8List upChunk = (noiseGate != null && gated.isNotEmpty)
-                ? noiseGate.process(gated)
-                : gated;
-            Uint8List outChunk = gated;
+            // 上行与成品各一个独立实例，互不串状态。回声残余已由 AEC3 自带
+            // 的频域 suppressor（分级 NLP）处理，这里不再叠时域相关门。
+            // 链路顺序：AEC3(含NLP)→陷波→底噪门→(上行编码 / 落盘)。
+            final Uint8List upChunk = (noiseGate != null && chunk.isNotEmpty)
+                ? noiseGate.process(chunk)
+                : chunk;
+            Uint8List outChunk = chunk;
             if (noiseGateOut != null && outChunk.isNotEmpty) {
               outChunk = noiseGateOut.process(outChunk);
             }
@@ -358,11 +331,22 @@ void audioProcessingWorker(SendPort mainSendPort) {
             // 延迟标定结束后重置 AEC（标定那 3s 故意不喂参考，滤波器状态已失效）。
             // 只重置算法句柄，绝不动 fileSink / encoder，否则成品会断流。
             aec?.reset();
-            // 标定期间参考与采集都不连续，两个门的历史同样作废：
-            // 留着旧的 lag / 噪底只会在标定后头几百毫秒做错判决。
-            gate?.reset();
+            // 标定期间参考与采集都不连续，底噪门的历史同样作废：
+            // 留着旧的噪底只会在标定后头几百毫秒做错判决。
             noiseGate?.reset();
             noiseGateOut?.reset();
+            break;
+
+          case 'nlp_level':
+            // 页面侧实时切换 AEC3 NLP 档（对标 TRTC aec_nlp_level）。
+            // 换档会重建 APM、重新收敛 ~1s；旧 native 库缺符号时返回 false。
+            final int level = (message['level'] as num?)?.toInt() ?? kNlpLevel;
+            final bool ok = aec?.setNlpLevel(level) ?? false;
+            mainSendPort.send({
+              'type': 'nlp_level_ack',
+              'level': aec?.nlpLevel ?? level,
+              'supported': ok,
+            });
             break;
 
           case 'howl_notch':
@@ -387,8 +371,6 @@ void audioProcessingWorker(SendPort mainSendPort) {
             // 与 pcm_chunk 走同一个端口，Dart 的 SendPort 是 FIFO，
             // 「先参考、后采集」的投递顺序天然成立（APM 的硬性要求）。
             aec?.pushReference(message['data']);
-            // 同时喂给下行相关门（用于判定「这帧里有多少是回声」）
-            gate?.pushReference(message['data']);
             break;
 
           case 'flush_chunk':
@@ -408,14 +390,7 @@ void audioProcessingWorker(SendPort mainSendPort) {
               'starved': st?.refStarvedFrames ?? 0,
               'bytesIn': bytesIn,
               'bytesOut': bytesOut,
-              // 相关门的对齐状态：真机上「lag 是不是一个合理值」直接决定
-              // 这层门有没有在工作 —— 之前它永远算不出 lag，所以从没生效过。
-              'gateLagMs': gate?.currentLagMs ?? -1,
-              'gateRho': gate?.lastRho,
-              'gateGain': gate?.currentGain,
-              'gateConverged': gate?.converged ?? true,
-              'gateNearEnd': gate?.lastNearEnd ?? false,
-              'gateRefLack': gate?.refLacking ?? false,
+              'nlpLevel': aec?.nlpLevel ?? kNlpLevel,
               'noiseFloor': noiseGate?.floorDbfs,
               'noiseGain': noiseGate?.gain,
             });
