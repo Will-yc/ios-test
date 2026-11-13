@@ -168,6 +168,8 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
 
   // ---------- 录音成品 ----------
   String? _pcmPath;
+  // 诊断日志（KEEP_RAW 时每秒一行：AEC 进出电平 / 门 lag / 陷波目标 / duck）
+  String? _statsPath;
   String _wavPath = '';
   int _pcmBytes = 0;
   Duration _elapsed = Duration.zero;
@@ -436,6 +438,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
             _gateRho = (message['gateRho'] as num?)?.toDouble() ?? 0;
             _noiseFloorDb = (message['noiseFloor'] as num?)?.toDouble() ?? -90;
           });
+          _writeStatsLine();
           break;
         case 'file-closed':
           if (_fileClosed != null && !_fileClosed!.isCompleted) {
@@ -615,6 +618,7 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       _phase = _Phase.starting;
       _wavPath = '';
       _pcmBytes = 0;
+      _statsPath = null;
       _elapsed = Duration.zero;
       _gotMicData = false;
       _inDbfs = -90;
@@ -902,6 +906,29 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
     } catch (_) {}
   }
 
+  /// 每秒一行诊断：用真实读数判断「是 AEC 没收敛、门在乱压，还是陷波挖到了语音」。
+  void _writeStatsLine() {
+    final String? sp = _statsPath;
+    if (sp == null) return;
+    final int ms = _recordStartAt == null
+        ? 0
+        : DateTime.now().difference(_recordStartAt!).inMilliseconds;
+    final String notch = _notchTargets.isEmpty
+        ? '-'
+        : _notchTargets.map((e) => e.toStringAsFixed(0)).join('/');
+    final String line = 't=${(ms / 1000).toStringAsFixed(1)} '
+        'in=${_inDbfs.toStringAsFixed(1)} out=${_outDbfs.toStringAsFixed(1)} '
+        'lag=$_gateLagMs rho=${_gateRho.toStringAsFixed(2)} '
+        'floor=${_noiseFloorDb.toStringAsFixed(1)} notch=$notch '
+        'vote=${_guard.howlVoteRatio.toStringAsFixed(2)} '
+        'peak=${_guard.lastPeakHz.toStringAsFixed(0)} '
+        'duck=${_guard.duckFactor.toStringAsFixed(2)} '
+        'frames=$_aecFrames starved=$_aecStarved\n';
+    try {
+      File(sp).writeAsStringSync(line, mode: FileMode.append);
+    } catch (_) {}
+  }
+
   Future<void> _beginRecordFile() async {
     final dir = await getApplicationDocumentsDirectory();
     final now = DateTime.now();
@@ -912,6 +939,14 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
         '${now.minute.toString().padLeft(2, '0')}'
         '${now.second.toString().padLeft(2, '0')}';
     final path = '${dir.path}/handsfree_${_identity}_$stamp.pcm';
+    _statsPath = kKeepRaw
+        ? path.replaceAll(RegExp(r'\.pcm$'), '_stats.log')
+        : null;
+    if (_statsPath != null) {
+      try {
+        File(_statsPath!).writeAsStringSync('');
+      } catch (_) {}
+    }
     _fileClosed = Completer<void>();
     _workerSendPort?.send({
       'type': 'init',
@@ -919,6 +954,9 @@ class _HandsfreeRoomPageState extends State<HandsfreeRoomPage>
       // 诊断轨道：AEC 之前的原始采集（KEEP_RAW=true 才有）
       'rawFilePath':
           kKeepRaw ? path.replaceAll(RegExp(r'\.pcm$'), '_raw.pcm') : null,
+      // 诊断轨道：AEC 实际看到的参考，用来离线算 ERLE / 回声延迟
+      'refFilePath':
+          kKeepRaw ? path.replaceAll(RegExp(r'\.pcm$'), '_ref.pcm') : null,
       'aecEnabled': true,
     });
     _workerSendPort?.send({

@@ -95,6 +95,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
     /// 诊断用：AEC **之前**的原始采集（只在该开关打开时有值）。
     /// 有了它就能离线直接算 ERLE / 看残余，不必靠人耳判断「还有没有回声」。
     IOSink? rawSink;
+    // 诊断轨道：AEC 实际看到的参考（页面压过 REF_DELAY 后送来的播放字节）。
+    // 有了它和 _raw.pcm，离线就能算出真实 ERLE 与回声延迟，不用再靠听感猜。
+    IOSink? refSink;
 
     bool isWriteRecordFile = false;
     bool isFirstChunk = true;
@@ -153,6 +156,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
             await rawSink?.flush();
             await rawSink?.close();
             rawSink = null;
+            await refSink?.flush();
+            await refSink?.close();
+            refSink = null;
             encoder?.dispose();
 
             // 每个分段开始都必须回到"首块"状态（这个 isolate 只建一次，
@@ -207,6 +213,10 @@ void audioProcessingWorker(SendPort mainSendPort) {
             if (rawPath != null && rawPath.isNotEmpty) {
               rawSink = File(rawPath).openWrite();
             }
+            final String? refPath = message['refFilePath'];
+            if (refPath != null && refPath.isNotEmpty) {
+              refSink = File(refPath).openWrite();
+            }
 
             encoder = OpusEncoder(
               sampleRate: kSampleRateUplink,
@@ -236,6 +246,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
               await rawSink?.flush();
               await rawSink?.close();
               rawSink = null;
+              await refSink?.flush();
+              await refSink?.close();
+              refSink = null;
               // 告诉主线程「这段文件的字节已经全部落盘」，导出 wav 必须等它，
               // 否则会读到缺尾巴的文件（wav 头里的长度是对的，内容却短一截）。
               mainSendPort.send({'type': 'file-closed'});
@@ -372,6 +385,12 @@ void audioProcessingWorker(SendPort mainSendPort) {
             aec?.pushReference(message['data']);
             // 同时喂给下行相关门（用于判定「这帧里有多少是回声」）
             gate?.pushReference(message['data']);
+            // 诊断轨道：AEC 实际看到的参考（只在 KEEP_RAW 时写）
+            if (refSink != null) {
+              try {
+                refSink.add(message['data']);
+              } catch (_) {}
+            }
             break;
 
           case 'flush_chunk':
@@ -414,6 +433,9 @@ void audioProcessingWorker(SendPort mainSendPort) {
             await rawSink?.flush();
             await rawSink?.close();
             rawSink = null;
+            await refSink?.flush();
+            await refSink?.close();
+            refSink = null;
             encoder?.dispose();
             encoder = null;
             // AEC3 句柄必须跟着 isolate 一起收回，否则每次开录漏一份滤波器内存
