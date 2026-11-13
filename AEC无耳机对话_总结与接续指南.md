@@ -935,3 +935,29 @@ python3 tool/analyze_product_health.py 成品1.wav 成品2.wav
 > 反面教材：曾用「逐帧逐 bin 与邻域比」找坑，在 7.7~8.2kHz 产生 45~59% 误报，
 > 高点名了一个**根本不存在**的 8k 坑（细谱实测 8000Hz 处只低 1~3dB）。
 > 判「有没有坑」一律用长时平均谱 + `_stats.log` 双证据。
+
+## 二十一、2026-11-13 TRTC 闭源基准（腿1 的量化目标）
+
+> 用 `trtc_pcm48_demo`（两台 Android，sdkAppId 1600172252 体验版，**11-18 到期**）
+> 录了同场景基准：`onCapturedAudioFrame` = 3A 之后、混远端之前，48k/单声道/16bit。
+> 后端 48086 签 userSig；demo 与后端配置已切到 1600172252。
+> 产物：`/tmp/trtc_base/phone1.wav`（125s）、2号机 wav 在 `~/Downloads/audio/test/`。
+> 分析脚本：`/tmp/trtc_base/timeline.py`（numpy，帧 20ms，p1/p2 时间线互参照分段）。
+
+| 指标 | TRTC 实测 | 我们成品（round1） | 结论 |
+|---|---|---|---|
+| 对端抑制 | **45.2 dB**（残余中位 -77.3 dBFS≈数字零） | AEC3 ERLE 31dB + 门压 -34dB | TRTC AEC+ANS 串联基本杀光对端 |
+| 双讲保留 | **-3.0 dB**（双讲时本端几乎不损失） | echoDominant 硬压切掉 33~40% 大能量帧 | **腿1 要追的目标** |
+| 切帧率（相邻语音帧骤降>12dB） | **1.1%** | 更高（听感 garble） | TRTC 软压无台阶 |
+| 语音→数字静音硬断口(≥200ms) | **0 处** | 有（靠底噪垫补） | ANS 连续性 |
+| 持续性窄带凹陷 | 无 | 无 | — |
+| 语音帧 16-20kHz | +3 dB（高频在） | 有（全频带旁路） | — |
+| 数字静音占比 | 25.4%（都在非语音期，ANS 关到底） | — | TRTC 也输出数字零，但只在无人说话时 |
+
+**腿1（residual_gate.dart echoDominant）验收线**：双讲损失 ≤3dB、切帧率 ≤1%、
+语音→静音硬断口 0 处。改法已批准未实施：VAD 前置 + 软压代替硬切 + cap<ref-6dB 边界。
+
+注意：demo 的 sdkAppId 是编译进 `lib/demo_config.dart` 的 const（1600172252），
+后端对应配置在 `zyxc-record-java/star-server` 的 `application.yaml`
+（`star.sms-code.room-sdk-app-id/key`，两处：src 和 target/classes）。体验版 11-18
+到期，过期后进房会重新报 -100013。

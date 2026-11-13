@@ -62,6 +62,7 @@ class ResidualGate {
     this.gFloor = 0.02, // -34dB
     this.smooth = 0.6,
     this.energyDropDb = 14.0,
+    this.echoHardMarginDb = 6.0,
     this.silentRefDbfs = -55.0,
     this.convergeMuteMs = 3000,
     this.doubleTalkGuard = true,
@@ -87,6 +88,16 @@ class ResidualGate {
 
   /// 本帧电平比参考低这么多 → 判「本端无人说话，全是残余」。
   final double energyDropDb;
+
+  /// **回声硬压边界**（腿1，2026-11-13，对齐 TRTC 基准）。
+  ///
+  /// 采集比参考低超过这么多 dB 才算「纯回声实锤」（衰减副本），echoDominant
+  /// 可整帧硬压到 [gFloor]；cap∈(ref-margin, ref] 是双讲重叠区，本端语音 +
+  /// 回声残余叠加后仍可能 ≤ 参考，硬切会切掉本端（旧版实测切掉 33~40% 大
+  /// 能量帧 → 频谱断裂），改由近端 VAD + rho 判决走软压 -6dB。
+  /// 取 6dB：AEC3 收敛后残余深低于参考（ERLE 20dB+），6dB 恰好把「衰减副本」
+  /// 与「叠加了本端语音」分开。
+  final double echoHardMarginDb;
 
   /// 参考电平低于此值 → 下行静默，无回声可消，强制直通。
   final double silentRefDbfs;
@@ -375,30 +386,54 @@ class ResidualGate {
             _lastCapDbfs < _lastRefDbfs - energyDropDb;
 
         // 能量主导判据（不依赖 lag 精度，成品优先）：下行在响 + 参考新鲜 +
-        // 采集不比参考响 → 麦克风能量能被下行完全解释 → 回声主导 → 硬压。
-        // 纯回声是参考的衰减副本（采集≤参考）；双讲本端叠加（采集>参考）才放行。
+        // 采集不比参考响 → 麦克风能量能被下行完全解释 → 回声主导。
         //
-        // 🔴 必须覆盖**所有 rho 区间**（2026-11-13 回归修复）：lag 搜不准时纯回声
-        // 的 rho 可落在 0~0.2 任意处。若只在 rho<=rhoNone 分支判能量，会漏掉过渡区
-        // ——rho 略高于 rhoNone 时线性增益≈1，响回声照样原样漏出（离线对照实测：
-        // 错位回声 rho≈0.07 落在过渡区，只压 5.8dB）。故把能量主导提到分支之前，
-        // 一旦命中直接 gFloor，rho 再低也不放行。
+        // 🟡 腿1（2026-11-13，TRTC 基准对齐）：旧版 echoDominant 命中一律
+        // gFloor(-34dB) 硬切。真机实测它切掉本端 33~40% 的大能量帧
+        // （Android 482/1453、iOS 595/1487）→ 成品频谱「断裂」。TRTC 同场景
+        // 基准：双讲损失仅 3dB、切帧率 1.1%、零硬断口。修法：
+        //   1) 6dB 边界：只有采集**明显低于**参考（> echoHardMarginDb）才算
+        //      纯回声可硬压 —— 纯回声是参考的衰减副本（AEC3 收敛后 ERLE
+        //      20dB+，深低于参考）；cap∈(ref-6dB, ref] 多半叠着本端语音；
+        //   2) VAD 前置：重叠区若近端 VAD 在说话且 rho 低（本端主导稀释了
+        //      回声相关）→ 改软压 -6dB（midFloorVoice），rho 越低越放开的
+        //      TRTC 式 NLP 分级，不再整帧硬切；
+        //   3) 其余情形（本端 VAD 没说话 / rho 仍高 / 深低于参考）维持硬压
+        //      —— 成品干净优先，不放松对纯回声的压制。
+        // RESIDUAL_GATE_DTLK=false 时 nearEndVad 恒 false → 行为与旧版一致。
         final bool echoDominant = !refLacking &&
             _lastRefDbfs > silentRefDbfs &&
             _lastCapDbfs <= _lastRefDbfs;
+        final bool capDeepBelowRef =
+            _lastCapDbfs < _lastRefDbfs - echoHardMarginDb;
 
         // 近端 VAD（双讲保护，对标 TRTC nearend unmute / aivad）：
-        // 本端在说话 = 采集明显高出噪底 + 相关性低 + **非回声主导（采集>参考）** +
-        // 不是纯残余。命中后过渡区改软压保留本端。纯回声因采集≤参考被 echoDominant
-        // 排除，绝不判双讲（旧版只看 rho<0.15+电平，misaligned 回声被误判软底放行）。
-        _lastNearEnd = doubleTalkGuard &&
+        // 本端在说话 = 采集明显高出自适应噪底 + 相关性低（rho 低 = 本端主导）。
+        // 单靠电平分不清「响回声」与「响本端」，真正区分两者的是相关性：
+        // 双讲稀释 rho（混合段 p50≈0.12），纯回声 rho 高（p50≈0.36~0.43）。
+        // 命中后：echoDominant 重叠区改软压、过渡区改软底，保本端不被误切。
+        final bool nearEndVad = doubleTalkGuard &&
             !residualOnly &&
-            !echoDominant &&
             rho < vadRhoMax &&
             _lastCapDbfs > _vadFloorDb + vadVoiceMarginDb;
+        _lastNearEnd = nearEndVad;
 
-        if (echoDominant) {
+        // 纯回声硬压：深低于参考（衰减副本实锤）或本端没在说话（VAD 未命中，
+        // 剩余能量只能是回声残余）→ 硬压到底。rho 再低也不放行（见上）。
+        final bool echoHard =
+            echoDominant && (!nearEndVad || capDeepBelowRef);
+        // 双讲重叠软压：echoDominant 命中但本端在说话、浅低于参考、rho 低
+        // → 只压 -6dB 保留本端可懂度（TRTC 基准实测这条路径双讲损失 ~3dB）。
+        final bool echoOverlapSoft = echoDominant && !echoHard;
+
+        if (echoHard) {
           g = gFloor;
+        } else if (echoOverlapSoft) {
+          // TRTC 式软压：rho 接近 vadRhoMax（回声成分重）→ 压到软底
+          // midFloorVoice(-6dB)；rho 接近 rhoNone（本端主导）→ 放开到 1。
+          final double t =
+              ((vadRhoMax - rho) / (vadRhoMax - rhoNone)).clamp(0.0, 1.0);
+          g = midFloorVoice + (1.0 - midFloorVoice) * t;
         } else if (rho >= rhoFull) {
           g = gFloor;
         } else if (rho <= rhoNone) {
@@ -407,7 +442,7 @@ class ResidualGate {
           final double t = (rho - rhoNone) / (rhoFull - rhoNone);
           // 过渡区：双讲帧用软底 [midFloorVoice](-6dB) 保留本端（TRTC NLP 分级）；
           // 纯回声帧仍用硬底 0.10(-20dB)，成品干净优先。
-          final double midFloor = _lastNearEnd ? midFloorVoice : 0.10;
+          final double midFloor = nearEndVad ? midFloorVoice : 0.10;
           g = midFloor + (1.0 - midFloor) * (1.0 - t);
         }
 
